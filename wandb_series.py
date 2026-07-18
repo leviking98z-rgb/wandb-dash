@@ -1,33 +1,103 @@
-"""wandb_series — 拉 wandb entity 下近期/活跃 run 的 metric 序列, 输出 JSON。
+"""wandb_series — 拉 wandb entity 下的 run 列表 + metric 序列, 输出 JSON。
 
-用【系统 python3】跑(它装了 wandb 0.28.0; console venv 没装, 保持干净)。WANDB_API_KEY
+用【本仓 venv python】跑(装了 wandb; console venv 没装, 保持干净)。WANDB_API_KEY
 从环境取(wandbdash 运行时从 .clusters/.tools/mon_wandb.sh 抽, 不把密钥写进本仓库)。
 wandbdash server shell 出本脚本 + TTL 缓存 + 前端画真曲线。
 
-用法: WANDB_API_KEY=... /usr/bin/python3 wandb_series.py [--entity E --keys reward,loss
-       --since-hours 72 --samples 200 --max-runs 8]
+两种模式:
+  列表模式(默认): 枚举 entity 下【全部】 run 的元数据(便宜, 只读 _attrs, 不碰 r.summary
+    —— 后者会对每个 run 惰性 HTTP 拉 summary 文件, 几百个 run 要几分钟), 再【只给最新的
+    --max-history 个】并行拉曲线(history 不传 keys, 跳过 summary 访问)。其余 run 也在列表里,
+    曲线按需(前端勾选时打 --run-* 单拉)。
+  单 run 模式: --run-project P --run-id I → 只拉这一个 run 的曲线(前端按需)。
+
+用法: WANDB_API_KEY=... python wandb_series.py [--entity E --keys reward,loss --samples 200
+       --max-history 40 --max-runs 1000]
+      python wandb_series.py --run-project P --run-id I
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
 import json
-import sys
 import time
+
+
+def _parse_ts(ts):
+    """iso 字符串 / epoch 秒 → aware datetime(UTC), 失败 None。"""
+    if ts is None:
+        return None
+    try:
+        if isinstance(ts, (int, float)):
+            return dt.datetime.fromtimestamp(float(ts), dt.timezone.utc)
+        return dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _clip(v, n=200):
+    s = v if isinstance(v, str) else v
+    if isinstance(s, str) and len(s) > n:
+        return s[:n] + "…"
+    return s
+
+
+def _config_of(r):
+    """从 _attrs(便宜, 无网络)取 config, 展平 wandb 的 {value,desc} 包装。"""
+    cfg = {}
+    try:
+        raw = dict(r.config)
+    except Exception:
+        return cfg
+    for ck, cv in raw.items():
+        if ck.startswith("_") or not isinstance(cv, (int, float, str, bool)):
+            continue
+        cfg[ck] = _clip(cv)
+        if len(cfg) >= 40:
+            break
+    return cfg
+
+
+def _history_metrics(r, subs, samples, max_metrics):
+    """拉一个 run 的曲线。不传 keys → 用采样 history 拿全部指标, 按 subs 过滤,
+    从而【不访问 r.summary】(那才是慢的根源)。返回 {metric: [[step,val,ts],...]}。"""
+    metrics = {}
+    try:
+        for row in r.history(samples=samples, pandas=False):
+            st, ts = row.get("_step"), row.get("_timestamp")
+            for k, v in row.items():
+                if k.startswith("_") or not isinstance(v, (int, float)):
+                    continue
+                if not any(s in k for s in subs):
+                    continue
+                metrics.setdefault(k, []).append([st, v, ts])
+    except Exception:
+        pass
+    metrics = {k: v for k, v in metrics.items() if len(v) >= 2}
+    if len(metrics) > max_metrics:
+        metrics = {k: metrics[k] for k in sorted(metrics)[:max_metrics]}
+    return metrics
+
+
+def _summary_terminal(metrics):
+    """终值(曲线最后一点)当 summary, 免去访问 r.summary。"""
+    return {k: pts[-1][1] for k, pts in metrics.items() if pts}
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--entity", default="leviking98z-zhejiang-university")
     ap.add_argument("--keys", default="reward,loss")
-    ap.add_argument("--since-hours", type=float, default=336.0)
     ap.add_argument("--samples", type=int, default=200)
-    ap.add_argument("--max-runs", type=int, default=24)
+    ap.add_argument("--max-runs", type=int, default=2000, help="列表上限(元数据, 便宜)")
+    ap.add_argument("--max-history", type=int, default=40, help="首屏自动拉曲线的 run 数(贵)")
     ap.add_argument("--max-metrics", type=int, default=6)
-    ap.add_argument("--per-project", type=int, default=10, help="每 project 看最新几个 run")
+    # 单 run 模式(前端按需拉某个 run 的曲线)
+    ap.add_argument("--run-project", default=None)
+    ap.add_argument("--run-id", default=None)
     a = ap.parse_args()
     subs = [k.strip() for k in a.keys.split(",") if k.strip()]
 
-    out = {"entity": a.entity, "ts": time.time(), "keys": subs, "runs": [], "error": None}
+    out = {"entity": a.entity, "ts": time.time(), "keys": subs, "error": None}
     try:
         import wandb
     except Exception as e:
@@ -36,79 +106,92 @@ def main():
 
     try:
         api = wandb.Api(timeout=45)
+
+        # ---- 单 run 模式: 拉这一个 run 的曲线 + config(前端勾选/看详情时按需) ----
+        # config/summary 都是惰性 HTTP(每 run 一次), 只在单拉时付这个钱, 不进列表枚举。
+        if a.run_id and a.run_project:
+            r = api.run(f"{a.entity}/{a.run_project}/{a.run_id}")
+            metrics = _history_metrics(r, subs, a.samples, a.max_metrics)
+            out["run"] = {"id": a.run_id, "project": a.run_project, "metrics": metrics,
+                          "summary": _summary_terminal(metrics), "config": _config_of(r)}
+            print(json.dumps(out)); return
+
         now = dt.datetime.now(dt.timezone.utc)
-        cutoff = a.since_hours * 3600
 
-        def age_of(r):
-            at = getattr(r, "_attrs", {}) or {}
-            ts = (at.get("updatedAt") or at.get("heartbeatAt") or at.get("createdAt")
-                  or getattr(r, "created_at", None))
-            if ts is None:
-                return None
-            try:
-                if isinstance(ts, (int, float)):        # epoch 秒
-                    return now.timestamp() - float(ts)
-                return (now - dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))).total_seconds()
-            except Exception:
-                return None
+        def attrs(r):
+            return getattr(r, "_attrs", {}) or {}
 
+        def age_of(at):
+            d = _parse_ts(at.get("updatedAt") or at.get("heartbeatAt") or at.get("createdAt"))
+            return (now - d).total_seconds() if d else None
+
+        def runtime_of(at):
+            c = _parse_ts(at.get("createdAt"))
+            h = _parse_ts(at.get("heartbeatAt") or at.get("updatedAt"))
+            if c and h:
+                s = (h - c).total_seconds()
+                if s >= 0:
+                    return int(s)
+            return None
+
+        # ---- 列表模式: 枚举【全部】 run 的元数据(只读 _attrs, 便宜) ----
         cand = []
         for p in api.projects(a.entity):
-            # 每 project 只看最新几个(order 新→旧, per_page 早停), 防遍历几百个 run
             try:
-                runs = api.runs(f"{a.entity}/{p.name}", order="-created_at", per_page=a.per_project)
+                runs = api.runs(f"{a.entity}/{p.name}", order="-created_at", per_page=200)
             except Exception:
                 continue
-            for i, r in enumerate(runs):
-                if i >= a.per_project:
+            for r in runs:
+                cand.append((r, p.name))
+                if len(cand) >= a.max_runs:
                     break
-                cand.append((age_of(r), r, p.name))
-        # running 优先; 再按最新(age 小)优先; 无 age 排最后
-        cand.sort(key=lambda x: (x[1].state != "running",
-                                 x[0] if x[0] is not None else 1e18))
-        # 优先窗口内的; 若窗口内不足 max_runs, 用最新的补足(没在跑也有曲线看)
-        within = [c for c in cand if c[0] is not None and c[0] <= cutoff]
-        chosen = within[:a.max_runs] or cand[:a.max_runs]
-        def fetch_one(item):
-            age, r, proj = item
-            try:
-                mkeys = [k for k in r.summary.keys()
-                         if not k.startswith("_") and any(s in k for s in subs)][:a.max_metrics]
-                # 批量: 一个 run 一次 history 拿全部指标(往返数 run×指标 → run 数)
-                metrics = {k: [] for k in mkeys}
-                if mkeys:
-                    for row in r.history(samples=a.samples, keys=mkeys + ["_timestamp"], pandas=False):
-                        st, ts = row.get("_step"), row.get("_timestamp")
-                        for k in mkeys:
-                            v = row.get(k)
-                            if isinstance(v, (int, float)):
-                                metrics[k].append([st, v, ts])
-                metrics = {k: v for k, v in metrics.items() if len(v) >= 2}
-                cfg = {}
-                for ck, cv in dict(r.config).items():
-                    if ck.startswith("_") or not isinstance(cv, (int, float, str, bool)):
-                        continue
-                    cfg[ck] = cv
-                    if len(cfg) >= 40:
-                        break
-                summ = {sk: r.summary.get(sk) for sk in mkeys
-                        if isinstance(r.summary.get(sk), (int, float))}
-                rt = r.summary.get("_runtime")
-                return {
-                    "name": r.name, "id": r.id, "project": proj, "state": r.state,
-                    "age_sec": int(age) if age and age < 1e17 else None,
-                    "runtime": int(rt) if isinstance(rt, (int, float)) else None,
-                    "created": str((getattr(r, "_attrs", {}) or {}).get("createdAt") or ""),
-                    "metrics": metrics, "config": cfg, "summary": summ,
-                }
-            except Exception:
-                return None
+            if len(cand) >= a.max_runs:
+                break
 
-        # 并行拉各 run 的 history(I/O 密集; 保序)
+        metas, by_id = [], {}
+        for r, proj in cand:
+            try:
+                at = attrs(r)
+                age = age_of(at)
+                m = {
+                    "name": r.name, "id": r.id, "project": proj, "state": r.state,
+                    "age_sec": int(age) if age is not None else None,
+                    "runtime": runtime_of(at),
+                    "created": str(at.get("createdAt") or ""),
+                    # config/summary 惰性 HTTP(每 run 一次, 全量拉 394 个要 ~2.5min) →
+                    # 列表里留空, 看详情/画曲线时按需单拉。
+                    "metrics": {}, "config": {}, "summary": {},
+                }
+                metas.append(m)
+                by_id[r.id] = (r, m)
+            except Exception:
+                continue
+
+        # running 优先; 再最新(age 小)优先; 无 age 排最后
+        metas.sort(key=lambda m: (m["state"] != "running",
+                                  m["age_sec"] if m["age_sec"] is not None else 1e18))
+
+        # ---- 首屏: 只给最新/在跑的前 max_history 个并行拉曲线 ----
+        targets = [m["id"] for m in metas[:a.max_history]]
+
+        def fetch_history(rid):
+            r, m = by_id[rid]
+            metrics = _history_metrics(r, subs, a.samples, a.max_metrics)
+            return rid, metrics
+
         with ThreadPoolExecutor(max_workers=8) as ex:
-            out["runs"] = [x for x in ex.map(fetch_one, chosen[:a.max_runs]) if x]
+            for rid, metrics in ex.map(fetch_history, targets):
+                _, m = by_id[rid]
+                m["metrics"] = metrics
+                if metrics:
+                    m["summary"] = _summary_terminal(metrics)
+
+        out["runs"] = metas
+        out["n_total"] = len(metas)
+        out["n_history"] = len(targets)
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"
+        out["runs"] = out.get("runs", [])
     print(json.dumps(out))
 
 

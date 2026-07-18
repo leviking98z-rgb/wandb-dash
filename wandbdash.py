@@ -24,6 +24,7 @@ _SERIES = str(Path(__file__).resolve().parent / "wandb_series.py")
 _MON_WANDB = os.environ.get("MON_WANDB_SH", "/root/shared/.clusters/.tools/mon_wandb.sh")
 _TTL = 60
 _cache: dict = {"ts": 0.0, "data": None}
+_hist_cache: dict = {}   # (project,id) -> (ts, run_dict); 单 run 曲线按需拉的缓存
 _lock = threading.Lock()
 
 
@@ -60,7 +61,7 @@ def _fetch() -> dict:
             return {**_cache["data"], "cached": round(now - _cache["ts"], 1)}
         env = {**os.environ, "WANDB_API_KEY": _api_key(), "WANDB_SILENT": "true"}
         try:
-            p = subprocess.run([sys.executable, _SERIES, "--max-runs", "24"],
+            p = subprocess.run([sys.executable, _SERIES],
                                capture_output=True, text=True, timeout=120, env=env)
             data = json.loads(p.stdout) if p.stdout.strip() else {"error": (p.stderr or "空输出")[:300], "runs": []}
         except subprocess.TimeoutExpired:
@@ -78,6 +79,29 @@ async def health(request):
 
 async def api_runs(request):
     return JSONResponse(_fetch())
+
+
+async def api_history(request):
+    """按需拉单个 run 的曲线 + config + summary(列表模式为省时不带这些)。"""
+    proj = request.query_params.get("project", "")
+    rid = request.query_params.get("id", "")
+    if not proj or not rid:
+        return JSONResponse({"error": "缺 project/id"}, status_code=400)
+    key = (proj, rid)
+    now = time.time()
+    hit = _hist_cache.get(key)
+    if hit and now - hit[0] < 300:
+        return JSONResponse({**hit[1], "cached": round(now - hit[0], 1)})
+    env = {**os.environ, "WANDB_API_KEY": _api_key(), "WANDB_SILENT": "true"}
+    try:
+        p = subprocess.run([sys.executable, _SERIES, "--run-project", proj, "--run-id", rid],
+                           capture_output=True, text=True, timeout=60, env=env)
+        d = json.loads(p.stdout) if p.stdout.strip() else {"error": (p.stderr or "空输出")[:200]}
+    except Exception as e:
+        d = {"error": f"{type(e).__name__}: {e}"}
+    run = d.get("run") or {"metrics": {}, "config": {}, "summary": {}, "error": d.get("error")}
+    _hist_cache[key] = (now, run)
+    return JSONResponse({**run, "cached": 0.0})
 
 
 async def index(request):
@@ -160,9 +184,10 @@ td.name{color:#58a6ff;cursor:pointer}
 <div id=modal onclick="if(event.target.id=='modal')this.style.display='none'"><div id=modalbox></div></div>
 <script>
 const PAL=['#3fb950','#58a6ff','#d29922','#f85149','#bc8cff','#39c5cf','#ff7b72','#e3b341'];
-let RAW={runs:[]}; const hidden=new Set(); const zoom={}; const COLOR={};
+let RAW={runs:[]}; const hidden=new Set(); const zoom={}; const COLOR={}; let inited=false;
 let smooth=0,logY=false,xmode='step'; let sortCol=null,sortDir=1; let page=0; const PS=10;
 const q=id=>document.getElementById(id), TIP=()=>q('tip');
+const nMetrics=r=>Object.keys(r&&r.metrics||{}).length;
 function fmtNum(v){if(v==null||isNaN(v))return '—';const a=Math.abs(v);if(a!==0&&(a<1e-3||a>=1e5))return v.toExponential(2);return (Math.round(v*1e4)/1e4).toString();}
 function fmtX(x){if(xmode==='time'){const d=new Date(x);return isNaN(d)?'-':d.toLocaleTimeString('zh',{hour12:false});}return Math.round(x).toString();}
 function fmtRt(s){if(s==null)return '—';s=Math.round(s);const h=Math.floor(s/3600),m=Math.floor(s%3600/60);if(h)return h+'h'+m+'m';if(m)return m+'m'+(s%60)+'s';return s+'s';}
@@ -171,14 +196,40 @@ function ema(pts,a){if(!(a>0))return pts.map(p=>[p.x,p.y]);let s=null,o=[];for(c
 
 function apply(){smooth=parseFloat(q('sm').value)||0;q('smv').textContent=smooth.toFixed(2);logY=q('logy').checked;xmode=q('xstep').checked?'step':'time';render();}
 function resetZoom(){for(const k in zoom)delete zoom[k];render();}
-function toggleRun(id){hidden.has(id)?hidden.delete(id):hidden.add(id);render();}
+async function toggleRun(id){if(hidden.has(id)){hidden.delete(id);await ensureHistory(id);}else{hidden.add(id);}render();}
 function toggleSide(){const s=q('side');const on=s.classList.toggle('open');q('sideback').classList.toggle('on',on);}
 
-async function load(){try{const r=await fetch('/api/wandb/runs');RAW=await r.json();
+async function load(){try{const r=await fetch('/api/wandb/runs');const nw=await r.json();
+ // 合并: 保留已按需拉到的曲线/config, 避免 30s 轮询把它们冲掉
+ const prev={};(RAW.runs||[]).forEach(x=>prev[x.id]=x);
+ (nw.runs||[]).forEach(x=>{const o=prev[x.id];if(o){if(!nMetrics(x)&&nMetrics(o))x.metrics=o.metrics;if(o._loaded){x._loaded=true;if(o.config&&Object.keys(o.config).length)x.config=o.config;if(o.summary&&Object.keys(o.summary).length&&!Object.keys(x.summary||{}).length)x.summary=o.summary;}}});
+ RAW=nw;
+ const runs=RAW.runs||[];
  q('sub').textContent=(RAW.entity||'')+(RAW.error?(' · ⚠'+RAW.error):'');
- q('upd').textContent='更新 '+(RAW.cached?RAW.cached+'s前':'刚刚')+' · '+(RAW.runs||[]).length+' run';
- (RAW.runs||[]).forEach((r,i)=>COLOR[r.id]=PAL[i%PAL.length]);render();
+ const nc=runs.filter(r=>nMetrics(r)).length;
+ q('upd').textContent='更新 '+(RAW.cached?RAW.cached+'s前':'刚刚')+' · '+runs.length+' run · '+nc+' 有曲线';
+ runs.forEach((r,i)=>{if(!COLOR[r.id])COLOR[r.id]=PAL[i%PAL.length];});
+ if(!inited){inited=true;
+   // 默认只画在跑的(没有则画前几个有曲线的), 其余 run 全在侧栏列表里可勾选
+   const running=runs.filter(r=>r.state==='running');
+   const show=(running.length?running:runs.filter(r=>nMetrics(r)).slice(0,6)).map(r=>r.id);
+   const ss=new Set(show); runs.forEach(r=>{if(!ss.has(r.id))hidden.add(r.id);});
+ }
+ render();
 }catch(e){q('charts').textContent='加载失败: '+e;}}
+
+// 按需拉某个 run 的曲线 + config(列表模式为省时不带)
+async function ensureHistory(id){
+ const r=(RAW.runs||[]).find(x=>x.id===id); if(!r||r._loaded||nMetrics(r))return;
+ r._loading=true; render();
+ try{const res=await fetch('/api/wandb/history?project='+encodeURIComponent(r.project)+'&id='+encodeURIComponent(r.id));
+   const d=await res.json();
+   if(d){if(d.metrics)r.metrics=d.metrics;
+     if(d.config&&Object.keys(d.config).length)r.config=d.config;
+     if(d.summary&&Object.keys(d.summary).length)r.summary=d.summary;}
+ }catch(e){}
+ r._loading=false; r._loaded=true;
+}
 
 function render(){
  const runs=RAW.runs||[];
@@ -189,7 +240,8 @@ function render(){
  const paged=filt.slice(page*PS,page*PS+PS);
  q('runlist').innerHTML=paged.map(r=>{
    const off=hidden.has(r.id);
-   return `<div class=run><input type=checkbox ${off?'':'checked'} onchange="toggleRun('${r.id}')"><i style="background:${COLOR[r.id]}"></i><div><span class=nm onclick="detail('${r.id}')">${r.name}</span><div class=props><span class="st-${r.state}">${r.state}</span> · ⏱${fmtRt(r.runtime)} · #${(r.id||'').slice(0,8)} · ${r.project}</div></div></div>`;
+   const mark=r._loading?' <span class=dim>⏳</span>':(nMetrics(r)?' <span title="有曲线">📈</span>':'');
+   return `<div class=run><input type=checkbox ${off?'':'checked'} onchange="toggleRun('${r.id}')"><i style="background:${COLOR[r.id]}"></i><div><span class=nm onclick="detail('${r.id}')">${r.name}</span>${mark}<div class=props><span class="st-${r.state}">${r.state}</span> · ⏱${fmtRt(r.runtime)} · #${(r.id||'').slice(0,8)} · ${r.project}</div></div></div>`;
  }).join('')||'<div class=dim style=padding:8px>无匹配 run</div>';
  q('pager').innerHTML=filt.length?`<button onclick="page--;render()" ${page<=0?'disabled':''}>‹</button><span class=dim>${page*PS+1}–${Math.min((page+1)*PS,filt.length)} / ${filt.length}${f?' (筛后)':''}</span><button onclick="page++;render()" ${page>=pages-1?'disabled':''}>›</button>`:'';
  // 主区: 图表(画所有勾选=未 hidden 的 run, 不受分页/过滤影响)
@@ -197,7 +249,7 @@ function render(){
  const metrics={};vis.forEach(r=>{for(const m in (r.metrics||{}))(metrics[m]=metrics[m]||[]).push(r);});
  const keys=Object.keys(metrics).sort();
  const cont=q('charts');cont.innerHTML='';
- if(!keys.length)cont.innerHTML='<span class=dim>暂无曲线(勾选的 run 无匹配指标)</span>';
+ if(!keys.length)cont.innerHTML='<span class=dim>暂无曲线 —— 侧栏勾选 run 即按需加载其曲线(默认只画在跑的)</span>';
  keys.forEach(m=>{const c=document.createElement('div');c.className='card';cont.appendChild(c);drawChart(c,m,metrics[m]);});
  buildTable(runs);
 }
@@ -253,7 +305,8 @@ function buildTable(runs){
 }
 function sortBy(i){if(sortCol===i)sortDir=-sortDir;else{sortCol=i;sortDir=1;}render();}
 
-function detail(id){const r=(RAW.runs||[]).find(x=>x.id===id);if(!r)return;
+async function detail(id){const r=(RAW.runs||[]).find(x=>x.id===id);if(!r)return;
+ if(!r._loaded&&!(r.config&&Object.keys(r.config).length)){await ensureHistory(id);render();}
  const kv=o=>Object.keys(o||{}).sort().map(k=>`<tr><td>${k}</td><td>${typeof o[k]==='number'?fmtNum(o[k]):String(o[k])}</td></tr>`).join('')||'<tr><td class=dim colspan=2>(空)</td></tr>';
  q('modalbox').innerHTML=`<div style=display:flex;align-items:center;gap:10px><span style=color:${COLOR[r.id]}>■</span><b style=font-size:14px>${r.name}</b><span class="dim st-${r.state}">${r.state} · ${r.project}</span><span class=spacer></span><button onclick="q('modal').style.display='none'">关闭</button></div>
   <div class=dim style=margin-top:4px>#${r.id} · runtime ${fmtRt(r.runtime)} · created ${r.created||'—'}</div>
@@ -269,6 +322,7 @@ routes = [
     Route("/", index),
     Route("/health", health, methods=["GET"]),
     Route("/api/wandb/runs", api_runs, methods=["GET"]),
+    Route("/api/wandb/history", api_history, methods=["GET"]),
 ]
 
 app = Starlette(routes=routes)
