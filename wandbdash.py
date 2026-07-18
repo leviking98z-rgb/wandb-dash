@@ -1,8 +1,7 @@
-"""wandbdash — wandb 训练曲线 dashboard(网页看真曲线, 非 ASCII; 学 wandb web 的交互)。
+"""wandbdash — wandb 训练曲线 dashboard(workspace 式: 左侧栏选 run + 右主区画曲线)。
 
 srv-wandb:8097。shell 出 wandb_series.py(本仓 venv, 装了 wandb)拉 entity 近期/活跃 run 的
-metric 序列(点=[step,val,ts] + config/summary)→ TTL 缓存(wandb API 慢, ~25s)→ 前端 SVG
-真曲线 + 交互(悬停看值/点 legend 开关 run/EMA 平滑/对数 Y/step-时间切换/框选缩放/runs 表格/run 详情)。
+metric 序列(点=[step,val,ts] + config/summary/runtime/created)→ TTL 缓存 → 前端 SVG 曲线 + 交互。
 WANDB_API_KEY 运行时从 .clusters/.tools/mon_wandb.sh 抽(不把密钥写进本仓库)。
 """
 from __future__ import annotations
@@ -41,7 +40,6 @@ _VERSION = _git_rev()
 
 
 def _api_key() -> str:
-    # 运行时从 mon_wandb.sh 抽 wandb key(不落进本仓库); 也允许 env 覆盖
     k = os.environ.get("WANDB_API_KEY")
     if k:
         return k
@@ -88,67 +86,84 @@ async def index(request):
 
 _PAGE = r"""<!doctype html><html lang=zh><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>wandb · 训练曲线</title><style>
-:root{--bg:#0d1117;--card:#161b22;--fg:#c9d1d9;--dim:#8b949e;--line:#30363d}
-body{background:var(--bg);color:var(--fg);font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0;padding:12px}
+<title>wandb · workspace</title><style>
+:root{--bg:#0d1117;--card:#161b22;--fg:#c9d1d9;--dim:#8b949e;--line:#30363d;--sel:#1f2733}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0;padding:10px}
 h1{font-size:15px;margin:0}.dim{color:var(--dim)}.spacer{flex:1}
 header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px}
 button{background:#21262d;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:3px 10px;cursor:pointer}
 button:hover{border-color:#58a6ff}
+#wrap{display:flex;gap:10px;align-items:flex-start}
+#side{width:280px;flex:none;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px;position:sticky;top:8px;max-height:calc(100vh - 20px);overflow:auto}
+#main{flex:1;min-width:0}
+#filter{width:100%;background:#0d1117;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 8px;margin-bottom:6px;font:inherit}
+.run{display:flex;align-items:flex-start;gap:6px;padding:5px 4px;border-radius:6px;cursor:default}
+.run:hover{background:var(--sel)}
+.run i{width:12px;height:12px;border-radius:3px;flex:none;margin-top:2px}
+.run .nm{color:#58a6ff;cursor:pointer;word-break:break-all}
+.run .props{color:var(--dim);font-size:10.5px}
+.st-running{color:#3fb950}.st-crashed,.st-failed,.st-killed{color:#f85149}.st-finished{color:#8b949e}
+#pager{display:flex;align-items:center;gap:8px;justify-content:center;margin-top:8px;font-size:11px}
+#pager button{padding:1px 8px}
 #ctl{display:flex;align-items:center;gap:16px;flex-wrap:wrap;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:10px;font-size:12px}
 #ctl label{display:inline-flex;align-items:center;gap:6px;cursor:pointer}
-input[type=range]{vertical-align:middle}
-#legend{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
-.chip{display:inline-flex;align-items:center;gap:5px;background:var(--card);border:1px solid var(--line);border-radius:20px;padding:2px 10px;cursor:pointer;user-select:none}
-.chip.off{opacity:.4;text-decoration:line-through}
-.chip i{width:14px;height:3px;display:inline-block;border-radius:2px}
-.st-running{color:#3fb950}.st-crashed,.st-failed,.st-killed{color:#f85149}.st-finished{color:#8b949e}
-#charts{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:12px}
+#charts{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px}
 .card h3{margin:2px 6px 4px;font-size:12px;font-weight:600}
 svg text{fill:var(--dim);font-size:10px}
 #tip{position:fixed;pointer-events:none;background:#1f2733;border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-size:11px;display:none;z-index:9;max-width:260px;box-shadow:0 2px 8px #0008}
 #tip b{color:var(--fg)}
+details{margin-top:12px}summary{cursor:pointer;color:#58a6ff;font-weight:600}
 table{border-collapse:collapse;width:100%;font-size:11px;margin-top:6px}
 th,td{border:1px solid var(--line);padding:3px 8px;text-align:right;white-space:nowrap}
 th:first-child,td:first-child{text-align:left}
-th{cursor:pointer;background:#1f2733;position:sticky;top:0}
+th{cursor:pointer;background:var(--sel);position:sticky;top:0}
 td.name{color:#58a6ff;cursor:pointer}
-#tblwrap{overflow:auto;max-height:340px;border-radius:8px;margin-top:8px}
+#tblwrap{overflow:auto;max-height:340px}
 #modal{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;z-index:20}
 #modalbox{background:var(--card);border:1px solid var(--line);border-radius:10px;max-width:90vw;max-height:80vh;overflow:auto;padding:16px;min-width:300px}
-#modalbox table{font-size:11px}
 .sec{margin:14px 0 4px;font-size:13px;font-weight:600;color:#58a6ff}
+@media(max-width:640px){#wrap{flex-direction:column}#side{width:100%;position:static;max-height:300px}}
 </style></head><body>
-<header><h1>📈 wandb 训练曲线</h1><span class=dim id=sub></span><span class=spacer></span>
+<header><h1>📈 wandb workspace</h1><span class=dim id=sub></span><span class=spacer></span>
 <span class=dim id=upd></span><button onclick=load()>刷新</button></header>
-<div id=ctl>
- <label>平滑 <input type=range id=sm min=0 max=0.95 step=0.05 value=0 oninput=apply()><span id=smv>0.00</span></label>
- <label><input type=checkbox id=logy onchange=apply()> 对数 Y</label>
- <label>X轴:
-   <label><input type=radio name=xm id=xstep checked onchange=apply()> step</label>
-   <label><input type=radio name=xm id=xtime onchange=apply()> 时间</label>
- </label>
- <button onclick=resetZoom()>复位缩放</button>
- <span class=dim>拖动图内框选放大 · 双击复位单图 · 点 legend 开关 run · 悬停看值</span>
+<div id=wrap>
+ <aside id=side>
+  <input id=filter placeholder="过滤 run(名/状态/项目)…" oninput="page=0;render()">
+  <div id=runlist></div>
+  <div id=pager></div>
+ </aside>
+ <main id=main>
+  <div id=ctl>
+   <label>平滑 <input type=range id=sm min=0 max=0.95 step=0.05 value=0 oninput=apply()><span id=smv>0.00</span></label>
+   <label><input type=checkbox id=logy onchange=apply()> 对数 Y</label>
+   <label>X:
+     <label><input type=radio name=xm id=xstep checked onchange=apply()> step</label>
+     <label><input type=radio name=xm id=xtime onchange=apply()> 时间</label></label>
+   <button onclick=resetZoom()>复位缩放</button>
+   <span class=dim>拖动框选放大 · 双击复位 · 悬停看值 · 侧栏勾选 run</span>
+  </div>
+  <div id=charts>加载中…</div>
+  <details id=tblsec><summary>Runs 表格(点表头排序 · 点 run 看 config/summary)</summary><div id=tblwrap></div></details>
+ </main>
 </div>
-<div id=legend></div><div id=charts>加载中…</div>
-<div class=sec>Runs 表格 <span class=dim style=font-weight:400>(点表头排序 · 点 run 名看 config/summary)</span></div>
-<div id=tblwrap></div>
 <div id=tip></div>
 <div id=modal onclick="if(event.target.id=='modal')this.style.display='none'"><div id=modalbox></div></div>
 <script>
 const PAL=['#3fb950','#58a6ff','#d29922','#f85149','#bc8cff','#39c5cf','#ff7b72','#e3b341'];
 let RAW={runs:[]}; const hidden=new Set(); const zoom={}; const COLOR={};
-let smooth=0,logY=false,xmode='step'; let sortCol=null,sortDir=1;
+let smooth=0,logY=false,xmode='step'; let sortCol=null,sortDir=1; let page=0; const PS=10;
 const q=id=>document.getElementById(id), TIP=()=>q('tip');
 function fmtNum(v){if(v==null||isNaN(v))return '—';const a=Math.abs(v);if(a!==0&&(a<1e-3||a>=1e5))return v.toExponential(2);return (Math.round(v*1e4)/1e4).toString();}
 function fmtX(x){if(xmode==='time'){const d=new Date(x);return isNaN(d)?'-':d.toLocaleTimeString('zh',{hour12:false});}return Math.round(x).toString();}
+function fmtRt(s){if(s==null)return '—';s=Math.round(s);const h=Math.floor(s/3600),m=Math.floor(s%3600/60);if(h)return h+'h'+m+'m';if(m)return m+'m'+(s%60)+'s';return s+'s';}
 function getX(p){return xmode==='time'?(p[2]?p[2]*1000:NaN):p[0];}
 function ema(pts,a){if(!(a>0))return pts.map(p=>[p.x,p.y]);let s=null,o=[];for(const p of pts){s=s==null?p.y:a*s+(1-a)*p.y;o.push([p.x,s]);}return o;}
 
 function apply(){smooth=parseFloat(q('sm').value)||0;q('smv').textContent=smooth.toFixed(2);logY=q('logy').checked;xmode=q('xstep').checked?'step':'time';render();}
 function resetZoom(){for(const k in zoom)delete zoom[k];render();}
+function toggleRun(id){hidden.has(id)?hidden.delete(id):hidden.add(id);render();}
 
 async function load(){try{const r=await fetch('/api/wandb/runs');RAW=await r.json();
  q('sub').textContent=(RAW.entity||'')+(RAW.error?(' · ⚠'+RAW.error):'');
@@ -158,16 +173,25 @@ async function load(){try{const r=await fetch('/api/wandb/runs');RAW=await r.jso
 
 function render(){
  const runs=RAW.runs||[];
- q('legend').innerHTML=runs.map(r=>`<span class="chip ${hidden.has(r.id)?'off':''}" onclick="toggleRun('${r.id}')"><i style="background:${COLOR[r.id]}"></i><b class="st-${r.state}">${r.name}</b> <span class=dim>${r.state}·${r.project}</span></span>`).join('')||'<span class=dim>无 run</span>';
+ // 侧栏: 过滤 + 分页
+ const f=(q('filter').value||'').toLowerCase();
+ const filt=runs.filter(r=>!f||(r.name+' '+r.state+' '+r.project).toLowerCase().includes(f));
+ const pages=Math.max(1,Math.ceil(filt.length/PS)); if(page>=pages)page=pages-1; if(page<0)page=0;
+ const paged=filt.slice(page*PS,page*PS+PS);
+ q('runlist').innerHTML=paged.map(r=>{
+   const off=hidden.has(r.id);
+   return `<div class=run><input type=checkbox ${off?'':'checked'} onchange="toggleRun('${r.id}')"><i style="background:${COLOR[r.id]}"></i><div><span class=nm onclick="detail('${r.id}')">${r.name}</span><div class=props><span class="st-${r.state}">${r.state}</span> · ⏱${fmtRt(r.runtime)} · #${(r.id||'').slice(0,8)} · ${r.project}</div></div></div>`;
+ }).join('')||'<div class=dim style=padding:8px>无匹配 run</div>';
+ q('pager').innerHTML=filt.length?`<button onclick="page--;render()" ${page<=0?'disabled':''}>‹</button><span class=dim>${page*PS+1}–${Math.min((page+1)*PS,filt.length)} / ${filt.length}${f?' (筛后)':''}</span><button onclick="page++;render()" ${page>=pages-1?'disabled':''}>›</button>`:'';
+ // 主区: 图表(画所有勾选=未 hidden 的 run, 不受分页/过滤影响)
  const vis=runs.filter(r=>!hidden.has(r.id));
  const metrics={};vis.forEach(r=>{for(const m in (r.metrics||{}))(metrics[m]=metrics[m]||[]).push(r);});
  const keys=Object.keys(metrics).sort();
  const cont=q('charts');cont.innerHTML='';
- if(!keys.length)cont.innerHTML='<span class=dim>暂无曲线数据(勾选的 run 无匹配指标)</span>';
+ if(!keys.length)cont.innerHTML='<span class=dim>暂无曲线(勾选的 run 无匹配指标)</span>';
  keys.forEach(m=>{const c=document.createElement('div');c.className='card';cont.appendChild(c);drawChart(c,m,metrics[m]);});
  buildTable(runs);
 }
-function toggleRun(id){hidden.has(id)?hidden.delete(id):hidden.add(id);render();}
 
 function drawChart(card,metric,runsForMetric){
  const W=560,H=210,pl=54,pr=12,pt=10,pb=24;
@@ -190,9 +214,9 @@ function drawChart(card,metric,runsForMetric){
  const xl=`<text x="${pl}" y="${H-6}">${fmtX(x0)}</text><text x="${W-pr}" y="${H-6}" text-anchor="end">${fmtX(x1)}</text>`;
  card.innerHTML=`<h3>${metric}${zoom[metric]?' <span class=dim style=font-weight:400>· 已缩放(双击复位)</span>':''}</h3>
   <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;touch-action:none">${grid}${lines}${xl}
-  <line class=cross y1=${pt} y2=${H-pb} stroke=#8b949e stroke-dasharray=3,3 style=display:none></line>
-  <rect class=band y=${pt} height=${H-pt-pb} fill=#58a6ff33 style=display:none></rect>
-  <rect class=ov x=${pl} y=${pt} width=${W-pl-pr} height=${H-pt-pb} fill=transparent style=cursor:crosshair></rect></svg>`;
+  <line class="cross" y1="${pt}" y2="${H-pb}" stroke="#8b949e" stroke-dasharray="3,3" style="display:none"></line>
+  <rect class="band" y="${pt}" height="${H-pt-pb}" fill="#58a6ff33" style="display:none"></rect>
+  <rect class="ov" x="${pl}" y="${pt}" width="${W-pl-pr}" height="${H-pt-pb}" fill="transparent" style="cursor:crosshair"></rect></svg>`;
  const svg=card.querySelector('svg'),cross=svg.querySelector('.cross'),band=svg.querySelector('.band'),ov=svg.querySelector('.ov');
  const evX=ev=>{const r=svg.getBoundingClientRect();const sx=(ev.clientX-r.left)/r.width*W;return{sx,dx:x0+(sx-pl)/(W-pl-pr)*xr};};
  let drag=null;
@@ -210,19 +234,20 @@ function drawChart(card,metric,runsForMetric){
 
 function buildTable(runs){
  const sumKeys=[...new Set(runs.flatMap(r=>Object.keys(r.summary||{})))].sort();
- const cols=[{k:'name',t:'run'},{k:'state',t:'state'},{k:'project',t:'project'},...sumKeys.map(k=>({k:'sum:'+k,t:k}))];
- const val=(r,c)=>c.k==='name'?r.name:c.k==='state'?r.state:c.k==='project'?r.project:(r.summary||{})[c.k.slice(4)];
+ const cols=[{k:'name',t:'run'},{k:'state',t:'state'},{k:'rt',t:'runtime'},{k:'project',t:'project'},...sumKeys.map(k=>({k:'sum:'+k,t:k}))];
+ const val=(r,c)=>c.k==='name'?r.name:c.k==='state'?r.state:c.k==='rt'?(r.runtime||0):c.k==='project'?r.project:(r.summary||{})[c.k.slice(4)];
  let rs=runs.slice();
  if(sortCol!=null){const c=cols[sortCol];rs.sort((a,b)=>{let x=val(a,c),y=val(b,c);if(typeof x==='number'&&typeof y==='number')return (x-y)*sortDir;return String(x).localeCompare(String(y))*sortDir;});}
  const th=cols.map((c,i)=>`<th onclick=sortBy(${i})>${c.t}${sortCol===i?(sortDir>0?' ▲':' ▼'):''}</th>`).join('');
- const tr=rs.map(r=>{const idx=runs.indexOf(r);return '<tr>'+cols.map((c,i)=>{let v=val(r,c);if(i===0)return `<td class=name onclick=detail(${idx})><span style=color:${COLOR[r.id]}>■</span> ${v}</td>`;if(c.k.startsWith('sum:'))v=typeof v==='number'?fmtNum(v):(v??'—');if(c.k==='state')return `<td class="st-${r.state}">${v}</td>`;return `<td>${v}</td>`;}).join('')+'</tr>';}).join('');
+ const tr=rs.map(r=>'<tr>'+cols.map((c,i)=>{let v=val(r,c);if(i===0)return `<td class=name onclick="detail('${r.id}')"><span style=color:${COLOR[r.id]}>■</span> ${v}</td>`;if(c.k==='rt')return `<td>${fmtRt(r.runtime)}</td>`;if(c.k.startsWith('sum:'))v=typeof v==='number'?fmtNum(v):(v??'—');if(c.k==='state')return `<td class="st-${r.state}">${v}</td>`;return `<td>${v}</td>`;}).join('')+'</tr>').join('');
  q('tblwrap').innerHTML=runs.length?`<table><thead><tr>${th}</tr></thead><tbody>${tr}</tbody></table>`:'<span class=dim>无 run</span>';
 }
 function sortBy(i){if(sortCol===i)sortDir=-sortDir;else{sortCol=i;sortDir=1;}render();}
 
-function detail(idx){const r=(RAW.runs||[])[idx];if(!r)return;
+function detail(id){const r=(RAW.runs||[]).find(x=>x.id===id);if(!r)return;
  const kv=o=>Object.keys(o||{}).sort().map(k=>`<tr><td>${k}</td><td>${typeof o[k]==='number'?fmtNum(o[k]):String(o[k])}</td></tr>`).join('')||'<tr><td class=dim colspan=2>(空)</td></tr>';
  q('modalbox').innerHTML=`<div style=display:flex;align-items:center;gap:10px><span style=color:${COLOR[r.id]}>■</span><b style=font-size:14px>${r.name}</b><span class="dim st-${r.state}">${r.state} · ${r.project}</span><span class=spacer></span><button onclick="q('modal').style.display='none'">关闭</button></div>
+  <div class=dim style=margin-top:4px>#${r.id} · runtime ${fmtRt(r.runtime)} · created ${r.created||'—'}</div>
   <div class=sec>summary(终值)</div><table>${kv(r.summary)}</table>
   <div class=sec>config</div><table>${kv(r.config)}</table>`;
  q('modal').style.display='flex';

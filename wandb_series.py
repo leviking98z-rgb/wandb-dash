@@ -100,9 +100,12 @@ def main():
                         summ[sk] = sv
             except Exception:
                 pass
+            rt = r.summary.get("_runtime")
             out["runs"].append({
                 "name": r.name, "id": r.id, "project": proj, "state": r.state,
                 "age_sec": int(age) if age and age < 1e17 else None,
+                "runtime": int(rt) if isinstance(rt, (int, float)) else None,
+                "created": str((getattr(r, "_attrs", {}) or {}).get("createdAt") or ""),
                 "metrics": metrics, "config": cfg, "summary": summ,
             })
     except Exception as e:
