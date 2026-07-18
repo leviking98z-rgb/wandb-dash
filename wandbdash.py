@@ -9,6 +9,8 @@ HTTP 请求只读快照 → 恒定秒开、重启即热、不内联等 wandb。s
   --run-project P --run-id I 单 run 的曲线+config+summary(按需 + 落盘)
 端点: /api/wandb/{projects,runs?project=X,history?project=&id=} + /health(含 sync 状态)。
 前端: 顶部下拉先选项目; 侧栏可经左侧竖条折叠; 每图带可点图例; 无表格。
+  看数值: 桌面悬停; 手机【触碰/滑动曲线】即显示(抬手保留, 点别处消失) —— 触屏无
+  hover, 故触屏拖动默认=读数, 勾选"触屏拖动=缩放"才改为框选放大; 双击复位。
 WANDB_API_KEY 运行时从 .clusters/.tools/mon_wandb.sh 抽(不把密钥写进本仓库)。
 """
 from __future__ import annotations
@@ -349,7 +351,8 @@ td.name{color:#58a6ff;cursor:pointer}
      <label><input type=radio name=xm id=xstep checked onchange=apply()> step</label>
      <label><input type=radio name=xm id=xtime onchange=apply()> 时间</label></label>
    <button onclick=resetZoom()>复位缩放</button>
-   <span class=dim>拖框放大 · 双击复位 · 悬停看值 · 点图例/勾选切换 run</span>
+   <label id=tzoomwrap style=display:none><input type=checkbox id=tzoom> 触屏拖动=缩放</label>
+   <span class=dim id=cthint>拖框放大 · 双击复位 · 悬停看值 · 点图例/勾选切换 run</span>
   </div>
   <div id=charts>加载中…</div>
  </main>
@@ -363,6 +366,9 @@ let PROJECTS=[]; let curProj=null;
 let smooth=0,logY=false,xmode='step'; let page=0; const PS=10;
 const q=id=>document.getElementById(id), TIP=()=>q('tip');
 const nMetrics=r=>Object.keys(r&&r.metrics||{}).length;
+const isTouch=ev=>!!(ev&&ev.pointerType&&ev.pointerType!=='mouse');   // 触屏/触控笔
+const tzoomOn=()=>{const c=q('tzoom');return !!(c&&c.checked);};       // 触屏拖动是否=缩放
+const TOUCH=('ontouchstart' in window)||navigator.maxTouchPoints>0;
 function fmtNum(v){if(v==null||isNaN(v))return '—';const a=Math.abs(v);if(a!==0&&(a<1e-3||a>=1e5))return v.toExponential(2);return (Math.round(v*1e4)/1e4).toString();}
 function fmtX(x){if(xmode==='time'){const d=new Date(x);return isNaN(d)?'-':d.toLocaleTimeString('zh',{hour12:false});}return Math.round(x).toString();}
 function fmtRt(s){if(s==null)return '—';s=Math.round(s);const h=Math.floor(s/3600),m=Math.floor(s%3600/60);if(h)return h+'h'+m+'m';if(m)return m+'m'+(s%60)+'s';return s+'s';}
@@ -473,16 +479,26 @@ function drawChart(card,metric,runsForMetric){
   <rect class="ov" x="${pl}" y="${pt}" width="${W-pl-pr}" height="${H-pt-pb}" fill="transparent" style="cursor:crosshair"></rect></svg>${legend}`;
  const svg=card.querySelector('svg'),cross=svg.querySelector('.cross'),band=svg.querySelector('.band'),ov=svg.querySelector('.ov');
  const evX=ev=>{const r=svg.getBoundingClientRect();const sx=(ev.clientX-r.left)/r.width*W;return{sx,dx:x0+(sx-pl)/(W-pl-pr)*xr};};
- let drag=null;
- ov.addEventListener('pointermove',ev=>{const {sx,dx}=evX(ev);
-   if(drag!=null){const a=X(drag);band.setAttribute('x',Math.min(a,sx));band.setAttribute('width',Math.abs(sx-a));band.style.display='';cross.style.display='none';TIP().style.display='none';return;}
+ const inspect=ev=>{const {sx,dx}=evX(ev);
    cross.setAttribute('x1',sx);cross.setAttribute('x2',sx);cross.style.display='';
    let html=`<b>${metric}</b> · ${xmode==='time'?'时间':'step'} ${fmtX(dx)}<br>`;
    series.forEach(s=>{let best=null,bd=1e18;for(const p of s.pts){const d=Math.abs(p[0]-dx);if(d<bd){bd=d;best=p;}}if(best)html+=`<span style=color:${s.color}>■</span> ${s.name}: <b>${fmtNum(best[1])}</b><br>`;});
-   const t=TIP();t.innerHTML=html;t.style.display='';t.style.left=Math.min(ev.clientX+12,innerWidth-t.offsetWidth-8)+'px';t.style.top=(ev.clientY+12)+'px';});
- ov.addEventListener('pointerdown',ev=>{ov.setPointerCapture(ev.pointerId);drag=evX(ev).dx;});
- ov.addEventListener('pointerup',ev=>{if(drag==null)return;const dx=evX(ev).dx;const a=Math.min(drag,dx),b=Math.max(drag,dx);drag=null;band.style.display='none';if(b-a>xr*0.02){zoom[metric]=[a,b];render();}});
- ov.addEventListener('pointerleave',()=>{cross.style.display='none';TIP().style.display='none';});
+   const t=TIP();t.innerHTML=html;t.style.display='block';
+   const left=Math.max(8,Math.min(ev.clientX+12,innerWidth-t.offsetWidth-8));
+   let top=isTouch(ev)?(ev.clientY-t.offsetHeight-22):(ev.clientY+12);   // 触屏: tooltip 放手指【上方】不被挡
+   if(top<6)top=ev.clientY+22;
+   t.style.left=left+'px';t.style.top=top+'px';};
+ let drag=null,scrub=false;
+ ov.addEventListener('pointermove',ev=>{
+   if(drag!=null){const sx=evX(ev).sx;const a=X(drag);band.setAttribute('x',Math.min(a,sx));band.setAttribute('width',Math.abs(sx-a));band.style.display='';cross.style.display='none';TIP().style.display='none';return;}
+   if(scrub||!isTouch(ev))inspect(ev);});   // 鼠标悬停, 或触屏滑动
+ ov.addEventListener('pointerdown',ev=>{ov.setPointerCapture(ev.pointerId);
+   if(isTouch(ev)&&!tzoomOn()){scrub=true;inspect(ev);}   // 触屏默认: 触碰/滑动即看数值
+   else drag=evX(ev).dx;});                                // 鼠标(或触屏勾了缩放): 拖动框选放大
+ ov.addEventListener('pointerup',ev=>{
+   if(drag!=null){const dx=evX(ev).dx;const a=Math.min(drag,dx),b=Math.max(drag,dx);drag=null;band.style.display='none';if(b-a>xr*0.02){zoom[metric]=[a,b];render();}return;}
+   scrub=false;});   // 触屏抬手: 保留 tooltip 让用户读(轻点别处消失)
+ ov.addEventListener('pointerleave',ev=>{if(!isTouch(ev)){cross.style.display='none';TIP().style.display='none';}});
  svg.addEventListener('dblclick',()=>{if(zoom[metric]){delete zoom[metric];render();}});
 }
 
@@ -495,6 +511,10 @@ async function detail(id){const r=(RAW.runs||[]).find(x=>x.id===id);if(!r)return
   <div class=sec>config</div><table>${kv(r.config)}</table>`;
  q('modal').style.display='flex';
 }
+if(TOUCH){q('tzoomwrap').style.display='inline-flex';
+ q('cthint').textContent='触碰/滑动曲线看数值(抬手保留, 点别处消失) · 双击复位 · 点图例切换 · 勾"缩放"后拖动放大';}
+// 触屏: 轻点图表外任意处 → 收起钉住的数值气泡
+document.addEventListener('pointerdown',ev=>{if(isTouch(ev)&&!(ev.target&&ev.target.classList&&ev.target.classList.contains('ov'))){TIP().style.display='none';document.querySelectorAll('svg .cross').forEach(c=>c.style.display='none');}});
 if(innerWidth<=640)document.body.classList.add('collapsed');
 updateGrip(); boot(); setInterval(()=>{if(curProj)loadRuns();},30000);
 </script></body></html>"""
