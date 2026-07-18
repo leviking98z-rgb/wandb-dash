@@ -89,8 +89,10 @@ def main():
     ap.add_argument("--keys", default="reward,loss")
     ap.add_argument("--samples", type=int, default=200)
     ap.add_argument("--max-runs", type=int, default=2000, help="列表上限(元数据, 便宜)")
-    ap.add_argument("--max-history", type=int, default=40, help="首屏自动拉曲线的 run 数(贵)")
+    ap.add_argument("--max-history", type=int, default=16, help="首屏自动拉曲线的 run 数(贵)")
     ap.add_argument("--max-metrics", type=int, default=6)
+    ap.add_argument("--project", default=None, help="只看这一个 project 的 run")
+    ap.add_argument("--list-projects", action="store_true", help="只列 project(便宜, 供先选项目)")
     # 单 run 模式(前端按需拉某个 run 的曲线)
     ap.add_argument("--run-project", default=None)
     ap.add_argument("--run-id", default=None)
@@ -134,15 +136,40 @@ def main():
                     return int(s)
             return None
 
-        # ---- 列表模式: 枚举【全部】 run 的元数据(只读 _attrs, 便宜) ----
+        # ---- 列 project 模式: 每个 project 探一个最新 run(并行, 便宜) → 供先选项目 ----
+        if a.list_projects:
+            names = [p.name for p in api.projects(a.entity)]
+
+            def probe(name):
+                info = {"name": name, "running": False, "latest": None, "state": None}
+                try:
+                    for r in api.runs(f"{a.entity}/{name}", order="-created_at", per_page=1):
+                        at = attrs(r)
+                        d = _parse_ts(at.get("updatedAt") or at.get("heartbeatAt") or at.get("createdAt"))
+                        info.update(running=(r.state == "running"),
+                                    latest=(d.timestamp() if d else None), state=r.state)
+                        break
+                except Exception:
+                    pass
+                return info
+
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                items = list(ex.map(probe, names))
+            # 在跑的在前; 再按最新活动新→旧; 空项目排最后
+            items.sort(key=lambda x: (not x["running"], -(x["latest"] or -1e18)))
+            out["projects"] = items
+            print(json.dumps(out)); return
+
+        # ---- 列表模式: 枚举 run 的元数据(只读 _attrs, 便宜)。--project 则只看该项目 ----
+        proj_names = [a.project] if a.project else [p.name for p in api.projects(a.entity)]
         cand = []
-        for p in api.projects(a.entity):
+        for name in proj_names:
             try:
-                runs = api.runs(f"{a.entity}/{p.name}", order="-created_at", per_page=200)
+                runs = api.runs(f"{a.entity}/{name}", order="-created_at", per_page=200)
             except Exception:
                 continue
             for r in runs:
-                cand.append((r, p.name))
+                cand.append((r, name))
                 if len(cand) >= a.max_runs:
                     break
             if len(cand) >= a.max_runs:
