@@ -338,6 +338,7 @@ body.collapsed #side{width:0;padding-left:0;padding-right:0;border-width:0;opaci
 .run .nm{color:#58a6ff;cursor:pointer;word-break:break-all}
 .run .props{color:var(--dim);font-size:10.5px}
 .sw{flex:none;margin-top:2px;vertical-align:middle}
+.dot{font-size:9px;margin-left:6px;vertical-align:middle}
 .tag{display:inline-block;background:#1f6feb26;color:#79c0ff;border:1px solid #1f6feb55;border-radius:4px;padding:0 5px;font-size:9.5px;vertical-align:middle}
 .st-running{color:#3fb950}.st-crashed,.st-failed,.st-killed{color:#f85149}.st-finished{color:#8b949e}
 #pager{display:flex;align-items:center;gap:8px;justify-content:center;margin-top:8px;font-size:11px}
@@ -479,8 +480,9 @@ function render(){
    const off=hidden.has(r.id);
    const mark=r._loading?' <span class=dim>⏳</span>':(nMetrics(r)?' <span title="有曲线">📈</span>':'');
    const sw=`<svg class=sw width=16 height=10><line x1=0 y1=5 x2=16 y2=5 stroke="${COLOR[r.id]}" stroke-width=2.5 stroke-dasharray="${DASH[r.id]||''}"></line></svg>`;
-   const grp=r.group?` <span class=tag>${r.group}</span>`:'';
-   return `<div class=run><input type=checkbox ${off?'':'checked'} onchange="toggleRun('${r.id}')">${sw}<div><span class=nm onclick="detail('${r.id}')">${r.name}</span>${mark}${grp}<div class=props><span class="st-${r.state}">${r.state}</span> · ⏱${fmtRt(r.runtime)} · #${(r.id||'').slice(0,8)}</div></div></div>`;
+   const dot=`<span class="dot st-${r.state}" title="${r.state}">●</span>`;   // 状态点: 绿=running 红=crashed…
+   const grp=r.group?`<span class=tag>${r.group}</span>`:'<span class=dim>无 group</span>';
+   return `<div class=run><input type=checkbox ${off?'':'checked'} onchange="toggleRun('${r.id}')">${sw}<div style=min-width:0><div><span class=nm onclick="detail('${r.id}')">${r.name}</span>${dot}${mark}</div><div class=props>${grp} · ⏱${fmtRt(r.runtime)} · #${(r.id||'').slice(0,8)}</div></div></div>`;
  }).join('')||'<div class=dim style=padding:8px>无匹配 run</div>';
  q('pager').innerHTML=filt.length?`<button onclick="page--;render()" ${page<=0?'disabled':''}>‹</button><span class=dim>${page*PS+1}–${Math.min((page+1)*PS,filt.length)} / ${filt.length}${f?' (筛后)':''}</span><button onclick="page++;render()" ${page>=pages-1?'disabled':''}>›</button>`:'';
  // 主区: 图表(画所有勾选=未 hidden 的 run, 不受分页/过滤影响)
