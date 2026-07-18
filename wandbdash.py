@@ -1,11 +1,14 @@
 """wandbdash — wandb 训练曲线 dashboard(先选 project → 侧栏选 run → 右主区画曲线)。
 
-srv-wandb:8097。三个数据端点都 shell 出 wandb_series.py(本仓 venv, 装了 wandb):
-  /api/wandb/projects        列 project(每个探一个最新 run, 便宜) → 前端下拉先选项目
-  /api/wandb/runs?project=X  该 project 全部 run 的元数据(只读 _attrs, 便宜) +
-                             首屏给最新/在跑的前 N 个并行拉曲线; 各带 TTL 缓存
-  /api/wandb/history?...     勾选 top-N 之外的 run/看详情时, 按需单拉其曲线+config+summary
-前端: 侧栏可经左侧竖条折叠; 每图带可点图例(点=隐藏该 run); 无表格。
+srv-wandb:8097。后台 syncer 线程主动把 wandb 下载进本地快照(.cache/, 原子落盘),
+HTTP 请求只读快照 → 恒定秒开、重启即热、不内联等 wandb。syncer 每 ~45s 一圈:
+在跑的项目每圈刷、已结束项目每 30min 刷一次(数据不变则跳过, 省 API); 请求缺失/硬
+过期(>1h, 兜底 syncer 挂了)才内联拉一次。数据仍由 wandb_series.py(本仓 venv)产出:
+  --list-projects            列 project(每个探一个最新 run)
+  --project X                该 project 全部 run 的元数据 + 前 N 个的曲线
+  --run-project P --run-id I 单 run 的曲线+config+summary(按需 + 落盘)
+端点: /api/wandb/{projects,runs?project=X,history?project=&id=} + /health(含 sync 状态)。
+前端: 顶部下拉先选项目; 侧栏可经左侧竖条折叠; 每图带可点图例; 无表格。
 WANDB_API_KEY 运行时从 .clusters/.tools/mon_wandb.sh 抽(不把密钥写进本仓库)。
 """
 from __future__ import annotations
@@ -24,13 +27,47 @@ from starlette.responses import HTMLResponse, JSONResponse
 from starlette.routing import Route
 
 _REPO = Path(__file__).resolve().parent
-_SERIES = str(Path(__file__).resolve().parent / "wandb_series.py")
+_SERIES = str(_REPO / "wandb_series.py")
 _MON_WANDB = os.environ.get("MON_WANDB_SH", "/root/shared/.clusters/.tools/mon_wandb.sh")
-_TTL = 60
-_proj_cache: dict = {"ts": 0.0, "data": None}   # project 列表(便宜)缓存
-_runs_cache: dict = {}   # project -> (ts, data); 每个 project 的 run 列表缓存
-_hist_cache: dict = {}   # (project,id) -> (ts, run_dict); 单 run 曲线按需拉的缓存
+_CACHE = _REPO / ".cache"        # 本地持久快照(gitignore); 后台 syncer 主动下载, 请求只读它
+
+_TTL = 60                        # (保留)内存新鲜阈值
+_SYNC_INTERVAL = float(os.environ.get("WANDB_SYNC_INTERVAL", "45"))   # 后台循环间隔(s)
+_IDLE_TTL = float(os.environ.get("WANDB_IDLE_TTL", "1800"))          # 已结束项目重刷间隔(s)
+_STALE_HARD = 3600.0             # 内存超这么旧才兜底内联重拉(防 syncer 挂了永远陈旧)
+
+_proj_cache: dict = {"ts": 0.0, "data": None}   # project 列表快照
+_runs_cache: dict = {}   # project -> (ts, data); 每个 project 的 run 列表快照
+_hist_cache: dict = {}   # (project,id) -> (ts, run_dict); 单 run 曲线快照
 _lock = threading.Lock()
+_syncer_started = False
+_sync_stat: dict = {"last": 0.0, "projects": 0, "runs": 0, "err": None}
+
+
+def _safe(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", s or "")
+
+
+def _read_json(name: str):
+    try:
+        p = _CACHE / name
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return None
+
+
+def _write_json(name: str, obj) -> None:
+    """原子落盘(写临时文件再 rename)。"""
+    try:
+        _CACHE.mkdir(exist_ok=True)
+        p = _CACHE / name
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(obj), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception:
+        pass
 
 
 def _git_rev() -> str:
@@ -65,44 +102,141 @@ def _series(*args, timeout=120) -> dict:
     return {"error": (p.stderr or "空输出")[:300]}
 
 
+# ---- 快照写入(内存 + 磁盘); 无锁: GIL 下单个赋值原子, 且几乎只有 syncer 单写者 ----
+def _set_projects(data: dict) -> None:
+    ts = time.time()
+    _proj_cache["ts"], _proj_cache["data"] = ts, data
+    _write_json("projects.json", {"ts": ts, "data": data})
+
+
+def _set_runs(project: str, data: dict) -> None:
+    ts = time.time()
+    _runs_cache[project] = (ts, data)
+    _write_json(f"runs__{_safe(project)}.json", {"ts": ts, "project": project, "data": data})
+
+
+def _set_hist(key, run: dict) -> None:
+    ts = time.time()
+    _hist_cache[key] = (ts, run)
+    _write_json(f"hist__{_safe(key[0])}__{_safe(key[1])}.json",
+                {"ts": ts, "key": list(key), "run": run})
+
+
+def _seed_from_disk() -> None:
+    """启动时把上次落盘的快照读回内存 → 重启即热, 不用等 wandb。"""
+    pj = _read_json("projects.json")
+    if isinstance(pj, dict) and "data" in pj:
+        _proj_cache["ts"], _proj_cache["data"] = pj.get("ts", 0.0), pj["data"]
+    if not _CACHE.is_dir():
+        return
+    try:
+        for f in _CACHE.glob("runs__*.json"):
+            d = _read_json(f.name)
+            if isinstance(d, dict) and d.get("project") and "data" in d:
+                _runs_cache[d["project"]] = (d.get("ts", 0.0), d["data"])
+        for f in _CACHE.glob("hist__*.json"):
+            d = _read_json(f.name)
+            if isinstance(d, dict) and d.get("key") and "run" in d:
+                _hist_cache[tuple(d["key"])] = (d.get("ts", 0.0), d["run"])
+    except Exception:
+        pass
+
+
+# ---- 请求路径: 只读快照(几乎总命中); 缺失或硬过期才兜底内联拉一次 ----
 def _fetch_projects() -> dict:
     now = time.time()
-    if _proj_cache["data"] and now - _proj_cache["ts"] < _TTL:
+    if _proj_cache["data"] is not None and now - _proj_cache["ts"] < _STALE_HARD:
         return {**_proj_cache["data"], "cached": round(now - _proj_cache["ts"], 1)}
     with _lock:
         now = time.time()
-        if _proj_cache["data"] and now - _proj_cache["ts"] < _TTL:
+        if _proj_cache["data"] is not None and now - _proj_cache["ts"] < _STALE_HARD:
             return {**_proj_cache["data"], "cached": round(now - _proj_cache["ts"], 1)}
         try:
-            data = _series("--list-projects", timeout=90)
+            d = _series("--list-projects", timeout=90)
         except Exception as e:
-            data = {"error": f"{type(e).__name__}: {e}", "projects": []}
-        _proj_cache["ts"], _proj_cache["data"] = now, data
-        return {**data, "cached": 0.0}
+            d = {"error": f"{type(e).__name__}: {e}", "projects": []}
+        if d.get("projects") is not None:
+            _set_projects(d)
+        return {**d, "cached": 0.0}
 
 
 def _fetch_runs(project: str) -> dict:
     now = time.time()
     hit = _runs_cache.get(project)
-    if hit and now - hit[0] < _TTL:
+    if hit and now - hit[0] < _STALE_HARD:
         return {**hit[1], "cached": round(now - hit[0], 1)}
     with _lock:
         hit = _runs_cache.get(project)
         now = time.time()
-        if hit and now - hit[0] < _TTL:
+        if hit and now - hit[0] < _STALE_HARD:
             return {**hit[1], "cached": round(now - hit[0], 1)}
         try:
-            data = _series("--project", project, timeout=120)
+            d = _series("--project", project, timeout=120)
         except subprocess.TimeoutExpired:
-            data = {"error": "wandb 拉取超时(>120s)", "runs": []}
+            d = {"error": "wandb 拉取超时(>120s)", "runs": []}
         except Exception as e:
-            data = {"error": f"{type(e).__name__}: {e}", "runs": []}
-        _runs_cache[project] = (now, data)
-        return {**data, "cached": 0.0}
+            d = {"error": f"{type(e).__name__}: {e}", "runs": []}
+        if d.get("runs") is not None:
+            _set_runs(project, d)
+        return {**d, "cached": 0.0}
+
+
+# ---- 后台 syncer: 主动把 wandb 下载进本地快照 ----
+def _sync_once() -> int:
+    pj = _series("--list-projects", timeout=90)
+    projs = pj.get("projects") or []
+    if projs or pj.get("projects") is not None:
+        _set_projects(pj)
+    now = time.time()
+    n = 0
+    for p in projs:                     # 已按"在跑的在前"排序 → 活跃项目先刷
+        name = p.get("name")
+        if not name:
+            continue
+        hit = _runs_cache.get(name)
+        last = hit[0] if hit else None
+        # 从没拉过 / 在跑(数据在变) / 已结束但超过重刷间隔 → 才拉; 否则跳过(省 API)
+        due = last is None or p.get("running") or (now - last > _IDLE_TTL)
+        if not due:
+            continue
+        d = _series("--project", name, "--max-history", "24", timeout=120)
+        if d.get("runs") is not None:
+            _set_runs(name, d)
+            n += 1
+    _sync_stat.update(last=time.time(), projects=len(projs), runs=n)
+    return n
+
+
+def _syncer() -> None:
+    while True:
+        try:
+            _sync_once()
+            _sync_stat["err"] = None
+        except Exception as e:
+            _sync_stat["err"] = f"{type(e).__name__}: {e}"
+        time.sleep(_SYNC_INTERVAL)
+
+
+def _start_syncer() -> None:
+    global _syncer_started
+    if _syncer_started:
+        return
+    _syncer_started = True
+    threading.Thread(target=_syncer, name="wandb-syncer", daemon=True).start()
 
 
 async def health(request):
-    return JSONResponse({"status": "ok", "service": "wandb", "version": _VERSION})
+    now = time.time()
+    return JSONResponse({
+        "status": "ok", "service": "wandb", "version": _VERSION,
+        "snapshot": {
+            "have_projects": _proj_cache["data"] is not None,
+            "cached_projects": len(_runs_cache),
+            "cached_runs_curves": len(_hist_cache),
+            "last_sync_age": round(now - _sync_stat["last"], 1) if _sync_stat["last"] else None,
+            "sync_err": _sync_stat["err"],
+        },
+    })
 
 
 async def api_projects(request):
@@ -125,14 +259,14 @@ async def api_history(request):
     key = (proj, rid)
     now = time.time()
     hit = _hist_cache.get(key)
-    if hit and now - hit[0] < 300:
+    if hit and now - hit[0] < _STALE_HARD:   # 快照够用直接返回(已结束 run 的曲线不变)
         return JSONResponse({**hit[1], "cached": round(now - hit[0], 1)})
     try:
         d = _series("--run-project", proj, "--run-id", rid, timeout=60)
     except Exception as e:
         d = {"error": f"{type(e).__name__}: {e}"}
     run = d.get("run") or {"metrics": {}, "config": {}, "summary": {}, "error": d.get("error")}
-    _hist_cache[key] = (now, run)
+    _set_hist(key, run)
     return JSONResponse({**run, "cached": 0.0})
 
 
@@ -374,4 +508,6 @@ routes = [
     Route("/api/wandb/history", api_history, methods=["GET"]),
 ]
 
+_seed_from_disk()   # 导入即用上次落盘的快照(重启即热)
+_start_syncer()     # 后台 syncer 线程(daemon), 主动下载 wandb → 本地快照
 app = Starlette(routes=routes)
