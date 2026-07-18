@@ -8,6 +8,7 @@ wandbdash server shell 出本脚本 + TTL 缓存 + 前端画真曲线。
        --since-hours 72 --samples 200 --max-runs 8]
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
 import json
 import sys
@@ -20,9 +21,9 @@ def main():
     ap.add_argument("--keys", default="reward,loss")
     ap.add_argument("--since-hours", type=float, default=336.0)
     ap.add_argument("--samples", type=int, default=200)
-    ap.add_argument("--max-runs", type=int, default=8)
+    ap.add_argument("--max-runs", type=int, default=24)
     ap.add_argument("--max-metrics", type=int, default=6)
-    ap.add_argument("--per-project", type=int, default=6, help="每 project 看最新几个 run")
+    ap.add_argument("--per-project", type=int, default=10, help="每 project 看最新几个 run")
     a = ap.parse_args()
     subs = [k.strip() for k in a.keys.split(",") if k.strip()]
 
@@ -68,46 +69,44 @@ def main():
         # 优先窗口内的; 若窗口内不足 max_runs, 用最新的补足(没在跑也有曲线看)
         within = [c for c in cand if c[0] is not None and c[0] <= cutoff]
         chosen = within[:a.max_runs] or cand[:a.max_runs]
-        for age, r, proj in chosen[:a.max_runs]:
-            mkeys = [k for k in r.summary.keys()
-                     if not k.startswith("_") and any(s in k for s in subs)][:a.max_metrics]
-            metrics = {}
-            for k in mkeys:
-                try:
-                    pts = [[row.get("_step"), row.get(k), row.get("_timestamp")]
-                           for row in r.history(samples=a.samples, keys=[k, "_timestamp"], pandas=False)
-                           if isinstance(row.get(k), (int, float))]
-                    if len(pts) >= 2:
-                        metrics[k] = pts
-                except Exception:
-                    pass
-            # config(仅标量, 截断) + summary(各 metric 终值) —— 供前端 run 详情/表格
-            cfg = {}
+        def fetch_one(item):
+            age, r, proj = item
             try:
+                mkeys = [k for k in r.summary.keys()
+                         if not k.startswith("_") and any(s in k for s in subs)][:a.max_metrics]
+                # 批量: 一个 run 一次 history 拿全部指标(往返数 run×指标 → run 数)
+                metrics = {k: [] for k in mkeys}
+                if mkeys:
+                    for row in r.history(samples=a.samples, keys=mkeys + ["_timestamp"], pandas=False):
+                        st, ts = row.get("_step"), row.get("_timestamp")
+                        for k in mkeys:
+                            v = row.get(k)
+                            if isinstance(v, (int, float)):
+                                metrics[k].append([st, v, ts])
+                metrics = {k: v for k, v in metrics.items() if len(v) >= 2}
+                cfg = {}
                 for ck, cv in dict(r.config).items():
                     if ck.startswith("_") or not isinstance(cv, (int, float, str, bool)):
                         continue
                     cfg[ck] = cv
                     if len(cfg) >= 40:
                         break
+                summ = {sk: r.summary.get(sk) for sk in mkeys
+                        if isinstance(r.summary.get(sk), (int, float))}
+                rt = r.summary.get("_runtime")
+                return {
+                    "name": r.name, "id": r.id, "project": proj, "state": r.state,
+                    "age_sec": int(age) if age and age < 1e17 else None,
+                    "runtime": int(rt) if isinstance(rt, (int, float)) else None,
+                    "created": str((getattr(r, "_attrs", {}) or {}).get("createdAt") or ""),
+                    "metrics": metrics, "config": cfg, "summary": summ,
+                }
             except Exception:
-                pass
-            summ = {}
-            try:
-                for sk in mkeys:
-                    sv = r.summary.get(sk)
-                    if isinstance(sv, (int, float)):
-                        summ[sk] = sv
-            except Exception:
-                pass
-            rt = r.summary.get("_runtime")
-            out["runs"].append({
-                "name": r.name, "id": r.id, "project": proj, "state": r.state,
-                "age_sec": int(age) if age and age < 1e17 else None,
-                "runtime": int(rt) if isinstance(rt, (int, float)) else None,
-                "created": str((getattr(r, "_attrs", {}) or {}).get("createdAt") or ""),
-                "metrics": metrics, "config": cfg, "summary": summ,
-            })
+                return None
+
+        # 并行拉各 run 的 history(I/O 密集; 保序)
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            out["runs"] = [x for x in ex.map(fetch_one, chosen[:a.max_runs]) if x]
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"
     print(json.dumps(out))

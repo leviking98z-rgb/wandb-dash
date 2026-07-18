@@ -60,7 +60,7 @@ def _fetch() -> dict:
             return {**_cache["data"], "cached": round(now - _cache["ts"], 1)}
         env = {**os.environ, "WANDB_API_KEY": _api_key(), "WANDB_SILENT": "true"}
         try:
-            p = subprocess.run([sys.executable, _SERIES, "--max-runs", "8"],
+            p = subprocess.run([sys.executable, _SERIES, "--max-runs", "24"],
                                capture_output=True, text=True, timeout=120, env=env)
             data = json.loads(p.stdout) if p.stdout.strip() else {"error": (p.stderr or "空输出")[:300], "runs": []}
         except subprocess.TimeoutExpired:
