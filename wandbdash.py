@@ -185,9 +185,9 @@ function drawChart(card,metric,runsForMetric){
  const X=v=>pl+(v-x0)/xr*(W-pl-pr);
  const YV=v=>logY?(v>0?Math.log10(v):y0):v;
  const Y=v=>H-pb-(YV(v)-y0)/yr*(H-pt-pb);
- let grid='';for(let i=0;i<=3;i++){const t=y0+yr*i/3;const py=H-pb-(t-y0)/yr*(H-pt-pb);grid+=`<line x1=${pl} y1=${py.toFixed(1)} x2=${W-pr} y2=${py.toFixed(1)} stroke=#21262d/><text x=6 y=${(py+3).toFixed(1)}>${fmtNum(logY?Math.pow(10,t):t)}</text>`;}
- const lines=series.map(s=>`<polyline fill=none stroke="${s.color}" stroke-width=1.5 points="${s.pts.map(p=>X(p[0]).toFixed(1)+','+Y(p[1]).toFixed(1)).join(' ')}"/>`).join('');
- const xl=`<text x=${pl} y=${H-6}>${fmtX(x0)}</text><text x=${W-pr} y=${H-6} text-anchor=end>${fmtX(x1)}</text>`;
+ let grid='';for(let i=0;i<=3;i++){const t=y0+yr*i/3;const py=H-pb-(t-y0)/yr*(H-pt-pb);grid+=`<line x1="${pl}" y1="${py.toFixed(1)}" x2="${W-pr}" y2="${py.toFixed(1)}" stroke="#21262d"></line><text x="6" y="${(py+3).toFixed(1)}">${fmtNum(logY?Math.pow(10,t):t)}</text>`;}
+ const lines=series.map(s=>`<polyline fill="none" stroke="${s.color}" stroke-width="1.5" points="${s.pts.map(p=>X(p[0]).toFixed(1)+','+Y(p[1]).toFixed(1)).join(' ')}"></polyline>`).join('');
+ const xl=`<text x="${pl}" y="${H-6}">${fmtX(x0)}</text><text x="${W-pr}" y="${H-6}" text-anchor="end">${fmtX(x1)}</text>`;
  card.innerHTML=`<h3>${metric}${zoom[metric]?' <span class=dim style=font-weight:400>· 已缩放(双击复位)</span>':''}</h3>
   <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;touch-action:none">${grid}${lines}${xl}
   <line class=cross y1=${pt} y2=${H-pb} stroke=#8b949e stroke-dasharray=3,3 style=display:none></line>
