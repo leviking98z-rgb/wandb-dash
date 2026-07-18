@@ -7,8 +7,11 @@ HTTP 请求只读快照 → 恒定秒开、重启即热、不内联等 wandb。s
   --list-projects            列 project(每个探一个最新 run)
   --project X                该 project 全部 run 的元数据 + 前 N 个的曲线
   --run-project P --run-id I 单 run 的曲线+config+summary(按需 + 落盘)
-端点: /api/wandb/{projects,runs?project=X,history?project=&id=} + /health(含 sync 状态)。
+  --set-group ...            设某 run 的 group 并 r.update() 写回 online wandb
+端点: /api/wandb/{projects,runs?project=X,history,setgroup(POST)} + /health(含 sync 状态)。
 前端: 顶部下拉先选项目; 侧栏可经左侧竖条折叠; 每图带可点图例; 无表格。
+  曲线区分 18 色 × 5 线型(实/虚/点/点划)=90 种; group 作为标签显示, 详情弹框可
+  编辑 group 并同步 online, wandb tags 只读显示。
   看数值: 桌面悬停; 手机【长按/拖动曲线】显示(吸附到真实数据点, 不看插值中间值)。
   缩放: 桌面拖框选; 手机【单点定范围端点→再点一处放大, 同处再点复位】; 双击复位。
 WANDB_API_KEY 运行时从 .clusters/.tools/mon_wandb.sh 抽(不把密钥写进本仓库)。
@@ -122,6 +125,21 @@ def _set_hist(key, run: dict) -> None:
     _hist_cache[key] = (ts, run)
     _write_json(f"hist__{_safe(key[0])}__{_safe(key[1])}.json",
                 {"ts": ts, "key": list(key), "run": run})
+
+
+def _apply_group(project: str, rid: str, group: str) -> None:
+    """写回成功后乐观更新本地快照(wandb 读回有几秒延迟, 别 refetch), 并落盘。"""
+    hit = _runs_cache.get(project)
+    if hit:
+        for r in hit[1].get("runs", []):
+            if r.get("id") == rid:
+                r["group"] = group
+        _write_json(f"runs__{_safe(project)}.json", {"ts": hit[0], "project": project, "data": hit[1]})
+    key = (project, rid)
+    if key in _hist_cache:
+        ts, run = _hist_cache[key]
+        run["group"] = group
+        _set_hist(key, run)
 
 
 def _seed_from_disk() -> None:
@@ -272,6 +290,26 @@ async def api_history(request):
     return JSONResponse({**run, "cached": 0.0})
 
 
+async def api_setgroup(request):
+    """设置某 run 的 group 并同步到 online wandb; 成功后乐观更新本地快照。"""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    proj = (body.get("project") or "").strip()
+    rid = (body.get("id") or "").strip()
+    grp = (body.get("group") or "").strip()
+    if not proj or not rid:
+        return JSONResponse({"error": "缺 project/id"}, status_code=400)
+    try:
+        d = _series("--set-group", "--run-project", proj, "--run-id", rid, "--group", grp, timeout=60)
+    except Exception as e:
+        d = {"error": f"{type(e).__name__}: {e}"}
+    if d.get("ok"):
+        _apply_group(proj, rid, d.get("group", ""))
+    return JSONResponse(d)
+
+
 async def index(request):
     return HTMLResponse(_PAGE)
 
@@ -297,9 +335,10 @@ body.collapsed #side{width:0;padding-left:0;padding-right:0;border-width:0;opaci
 #filter{width:100%;background:#0d1117;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 8px;margin-bottom:6px;font:inherit}
 .run{display:flex;align-items:flex-start;gap:6px;padding:5px 4px;border-radius:6px;cursor:default}
 .run:hover{background:var(--sel)}
-.run i{width:12px;height:12px;border-radius:3px;flex:none;margin-top:2px}
 .run .nm{color:#58a6ff;cursor:pointer;word-break:break-all}
 .run .props{color:var(--dim);font-size:10.5px}
+.sw{flex:none;margin-top:2px;vertical-align:middle}
+.tag{display:inline-block;background:#1f6feb26;color:#79c0ff;border:1px solid #1f6feb55;border-radius:4px;padding:0 5px;font-size:9.5px;vertical-align:middle}
 .st-running{color:#3fb950}.st-crashed,.st-failed,.st-killed{color:#f85149}.st-finished{color:#8b949e}
 #pager{display:flex;align-items:center;gap:8px;justify-content:center;margin-top:8px;font-size:11px}
 #pager button{padding:1px 8px}
@@ -359,8 +398,9 @@ td.name{color:#58a6ff;cursor:pointer}
 <div id=tip></div>
 <div id=modal onclick="if(event.target.id=='modal')this.style.display='none'"><div id=modalbox></div></div>
 <script>
-const PAL=['#3fb950','#58a6ff','#d29922','#f85149','#bc8cff','#39c5cf','#ff7b72','#e3b341'];
-let RAW={runs:[]}; const hidden=new Set(); const zoom={}; const COLOR={}; let inited=false;
+const PAL=['#58a6ff','#3fb950','#f2cc60','#f85149','#bc8cff','#39c5cf','#ff7b72','#e3b341','#ff9bce','#7ee787','#79c0ff','#d2a8ff','#ffa657','#56d4dd','#f778ba','#a5d6ff','#ffdf5d','#7ce38b'];
+const DASHES=['','6,3','1,3','9,4,2,4','3,3'];   // 实线/长虚/点线/点划/短虚 —— 颜色用完再叠线型, 18×5=90 种
+let RAW={runs:[]}; const hidden=new Set(); const zoom={}; const COLOR={}; const DASH={}; let inited=false;
 let PROJECTS=[]; let curProj=null;
 let smooth=0,logY=false,xmode='step'; let page=0; const PS=10;
 const q=id=>document.getElementById(id), TIP=()=>q('tip');
@@ -405,7 +445,7 @@ async function loadRuns(){if(!curProj)return;try{
  if(RAW.error)q('sub').textContent=(RAW.entity||'')+' · ⚠'+RAW.error;
  const nc=runs.filter(r=>nMetrics(r)).length;
  q('upd').textContent='更新 '+(RAW.cached?RAW.cached+'s前':'刚刚')+' · '+curProj+' · '+runs.length+' run · '+nc+' 有曲线';
- runs.forEach((r,i)=>{if(!COLOR[r.id])COLOR[r.id]=PAL[i%PAL.length];});
+ runs.forEach((r,i)=>{if(!COLOR[r.id]){COLOR[r.id]=PAL[i%PAL.length];DASH[r.id]=DASHES[Math.floor(i/PAL.length)%DASHES.length];}});
  if(!inited){inited=true;
    // 默认只画在跑的(没有则画前几个有曲线的), 其余 run 都在侧栏列表里可勾选
    const running=runs.filter(r=>r.state==='running');
@@ -432,13 +472,15 @@ function render(){
  const runs=RAW.runs||[];
  // 侧栏: 过滤(选定 project 内) + 分页
  const f=(q('filter').value||'').toLowerCase();
- const filt=runs.filter(r=>!f||(r.name+' '+r.state).toLowerCase().includes(f));
+ const filt=runs.filter(r=>!f||(r.name+' '+r.state+' '+(r.group||'')+' '+((r.tags||[]).join(' '))).toLowerCase().includes(f));
  const pages=Math.max(1,Math.ceil(filt.length/PS)); if(page>=pages)page=pages-1; if(page<0)page=0;
  const paged=filt.slice(page*PS,page*PS+PS);
  q('runlist').innerHTML=paged.map(r=>{
    const off=hidden.has(r.id);
    const mark=r._loading?' <span class=dim>⏳</span>':(nMetrics(r)?' <span title="有曲线">📈</span>':'');
-   return `<div class=run><input type=checkbox ${off?'':'checked'} onchange="toggleRun('${r.id}')"><i style="background:${COLOR[r.id]}"></i><div><span class=nm onclick="detail('${r.id}')">${r.name}</span>${mark}<div class=props><span class="st-${r.state}">${r.state}</span> · ⏱${fmtRt(r.runtime)} · #${(r.id||'').slice(0,8)}</div></div></div>`;
+   const sw=`<svg class=sw width=16 height=10><line x1=0 y1=5 x2=16 y2=5 stroke="${COLOR[r.id]}" stroke-width=2.5 stroke-dasharray="${DASH[r.id]||''}"></line></svg>`;
+   const grp=r.group?` <span class=tag>${r.group}</span>`:'';
+   return `<div class=run><input type=checkbox ${off?'':'checked'} onchange="toggleRun('${r.id}')">${sw}<div><span class=nm onclick="detail('${r.id}')">${r.name}</span>${mark}${grp}<div class=props><span class="st-${r.state}">${r.state}</span> · ⏱${fmtRt(r.runtime)} · #${(r.id||'').slice(0,8)}</div></div></div>`;
  }).join('')||'<div class=dim style=padding:8px>无匹配 run</div>';
  q('pager').innerHTML=filt.length?`<button onclick="page--;render()" ${page<=0?'disabled':''}>‹</button><span class=dim>${page*PS+1}–${Math.min((page+1)*PS,filt.length)} / ${filt.length}${f?' (筛后)':''}</span><button onclick="page++;render()" ${page>=pages-1?'disabled':''}>›</button>`:'';
  // 主区: 图表(画所有勾选=未 hidden 的 run, 不受分页/过滤影响)
@@ -455,9 +497,9 @@ function drawChart(card,metric,runsForMetric){
  let series=runsForMetric.map(r=>{
    let pts=(r.metrics[metric]||[]).map(p=>({x:getX(p),y:p[1]})).filter(p=>isFinite(p.x)&&isFinite(p.y)).sort((a,b)=>a.x-b.x);
    const z=zoom[metric];if(z)pts=pts.filter(p=>p.x>=z[0]&&p.x<=z[1]);
-   return {id:r.id,name:r.name,color:COLOR[r.id],pts:ema(pts,smooth)};
+   return {id:r.id,name:r.name,color:COLOR[r.id],dash:DASH[r.id]||'',pts:ema(pts,smooth)};
  }).filter(s=>s.pts.length>=1);
- const legend='<div class=legend>'+series.map(s=>`<span onclick="toggleRun('${s.id}')" title="点击隐藏 ${s.name}"><i style="background:${s.color}"></i>${s.name}</span>`).join('')+'</div>';
+ const legend='<div class=legend>'+series.map(s=>`<span onclick="toggleRun('${s.id}')" title="点击隐藏 ${s.name}"><svg class=sw width=20 height=8><line x1=0 y1=4 x2=20 y2=4 stroke="${s.color}" stroke-width=2 stroke-dasharray="${s.dash}"></line></svg>${s.name}</span>`).join('')+'</div>';
  let xs=[],ys=[];series.forEach(s=>s.pts.forEach(p=>{xs.push(p[0]);ys.push(p[1]);}));
  if(xs.length<2){card.innerHTML=`<h3>${metric}</h3><div class=dim style=padding:16px>无点</div>${legend}`;return;}
  const x0=Math.min(...xs),x1=Math.max(...xs);
@@ -470,7 +512,7 @@ function drawChart(card,metric,runsForMetric){
  // 只在【真实数据点】的 x 上取值(不看插值中间值, 同 wandb)
  const gridX=[...new Set(series.flatMap(s=>s.pts.map(p=>p[0])))].sort((a,b)=>a-b);
  let grid='';for(let i=0;i<=3;i++){const t=y0+yr*i/3;const py=H-pb-(t-y0)/yr*(H-pt-pb);grid+=`<line x1="${pl}" y1="${py.toFixed(1)}" x2="${W-pr}" y2="${py.toFixed(1)}" stroke="#21262d"></line><text x="6" y="${(py+3).toFixed(1)}">${fmtNum(logY?Math.pow(10,t):t)}</text>`;}
- const lines=series.map(s=>`<polyline fill="none" stroke="${s.color}" stroke-width="1.5" points="${s.pts.map(p=>X(p[0]).toFixed(1)+','+Y(p[1]).toFixed(1)).join(' ')}"></polyline>`).join('');
+ const lines=series.map(s=>`<polyline fill="none" stroke="${s.color}" stroke-width="1.5" stroke-dasharray="${s.dash}" points="${s.pts.map(p=>X(p[0]).toFixed(1)+','+Y(p[1]).toFixed(1)).join(' ')}"></polyline>`).join('');
  const xl=`<text x="${pl}" y="${H-6}">${fmtX(x0)}</text><text x="${W-pr}" y="${H-6}" text-anchor="end">${fmtX(x1)}</text>`;
  card.innerHTML=`<h3>${metric}${zoom[metric]?' <span class=dim style=font-weight:400>· 已缩放(双击复位)</span>':''}</h3>
   <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;touch-action:none">${grid}${lines}${xl}
@@ -534,11 +576,26 @@ function drawChart(card,metric,runsForMetric){
 async function detail(id){const r=(RAW.runs||[]).find(x=>x.id===id);if(!r)return;
  if(!r._loaded&&!(r.config&&Object.keys(r.config).length)){await ensureHistory(id);render();}
  const kv=o=>Object.keys(o||{}).sort().map(k=>`<tr><td>${k}</td><td>${typeof o[k]==='number'?fmtNum(o[k]):String(o[k])}</td></tr>`).join('')||'<tr><td class=dim colspan=2>(空)</td></tr>';
+ const esc=s=>String(s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+ const tagsHtml=(r.tags&&r.tags.length)?`<div class=sec>tags(wandb)</div><div>${r.tags.map(t=>`<span class=tag>${t}</span>`).join(' ')}</div>`:'';
  q('modalbox').innerHTML=`<div style=display:flex;align-items:center;gap:10px><span style=color:${COLOR[r.id]}>■</span><b style=font-size:14px>${r.name}</b><span class="dim st-${r.state}">${r.state} · ${r.project}</span><span class=spacer></span><button onclick="q('modal').style.display='none'">关闭</button></div>
   <div class=dim style=margin-top:4px>#${r.id} · runtime ${fmtRt(r.runtime)} · created ${r.created||'—'}</div>
+  <div class=sec>group(编辑并同步到 online wandb)</div>
+  <div style="display:flex;gap:6px;align-items:center"><input id=grpin value="${esc(r.group)}" placeholder="(无 group, 可填写)" style="flex:1;background:#0d1117;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 8px;font:inherit"><button onclick="saveGroup('${r.id}')">保存并同步</button></div>
+  <div id=grpstat class=dim style=margin-top:4px></div>
+  ${tagsHtml}
   <div class=sec>summary(终值)</div><table>${kv(r.summary)}</table>
   <div class=sec>config</div><table>${kv(r.config)}</table>`;
  q('modal').style.display='flex';
+}
+async function saveGroup(id){const r=(RAW.runs||[]).find(x=>x.id===id);if(!r)return;
+ const g=(q('grpin').value||'').trim(); const st=q('grpstat');
+ st.textContent='保存中… 正在同步到 online wandb';
+ try{const res=await fetch('/api/wandb/setgroup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project:r.project,id:r.id,group:g})});
+   const d=await res.json();
+   if(d.ok){r.group=d.group||'';st.textContent='已保存并同步 ✓  group = '+(d.group||'(空)');render();}
+   else st.textContent='失败: '+(d.error||'未知错误');
+ }catch(e){st.textContent='失败: '+e;}
 }
 if(TOUCH){q('cthint').textContent='长按/拖动看数值(吸附数据点) · 单点定范围端点 · 再点一处放大 · 同处再点复位';}
 // 触屏: 轻点图表外任意处 → 收起钉住的数值气泡与高亮点
@@ -554,6 +611,7 @@ routes = [
     Route("/api/wandb/projects", api_projects, methods=["GET"]),
     Route("/api/wandb/runs", api_runs, methods=["GET"]),
     Route("/api/wandb/history", api_history, methods=["GET"]),
+    Route("/api/wandb/setgroup", api_setgroup, methods=["POST"]),
 ]
 
 _seed_from_disk()   # 导入即用上次落盘的快照(重启即热)

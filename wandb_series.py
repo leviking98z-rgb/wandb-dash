@@ -96,6 +96,8 @@ def main():
     # 单 run 模式(前端按需拉某个 run 的曲线)
     ap.add_argument("--run-project", default=None)
     ap.add_argument("--run-id", default=None)
+    ap.add_argument("--set-group", action="store_true", help="把 --group 写回该 run(同步到 online wandb)")
+    ap.add_argument("--group", default=None)
     a = ap.parse_args()
     subs = [k.strip() for k in a.keys.split(",") if k.strip()]
 
@@ -109,13 +111,25 @@ def main():
     try:
         api = wandb.Api(timeout=45)
 
+        # ---- 写回 group → 同步到 online wandb(r.group=... ; r.update() 发 groupName) ----
+        if a.set_group and a.run_id and a.run_project:
+            r = api.run(f"{a.entity}/{a.run_project}/{a.run_id}")
+            g = (a.group or "").strip()
+            r.group = g if g else None      # 空串 → None 才能清除
+            r.update()
+            out["ok"] = True
+            out["group"] = r.group or ""
+            print(json.dumps(out)); return
+
         # ---- 单 run 模式: 拉这一个 run 的曲线 + config(前端勾选/看详情时按需) ----
         # config/summary 都是惰性 HTTP(每 run 一次), 只在单拉时付这个钱, 不进列表枚举。
         if a.run_id and a.run_project:
             r = api.run(f"{a.entity}/{a.run_project}/{a.run_id}")
+            at = getattr(r, "_attrs", {}) or {}
             metrics = _history_metrics(r, subs, a.samples, a.max_metrics)
             out["run"] = {"id": a.run_id, "project": a.run_project, "metrics": metrics,
-                          "summary": _summary_terminal(metrics), "config": _config_of(r)}
+                          "summary": _summary_terminal(metrics), "config": _config_of(r),
+                          "group": at.get("group") or "", "tags": at.get("tags") or []}
             print(json.dumps(out)); return
 
         now = dt.datetime.now(dt.timezone.utc)
@@ -185,6 +199,7 @@ def main():
                     "age_sec": int(age) if age is not None else None,
                     "runtime": runtime_of(at),
                     "created": str(at.get("createdAt") or ""),
+                    "group": at.get("group") or "", "tags": at.get("tags") or [],
                     # config/summary 惰性 HTTP(每 run 一次, 全量拉 394 个要 ~2.5min) →
                     # 列表里留空, 看详情/画曲线时按需单拉。
                     "metrics": {}, "config": {}, "summary": {},
