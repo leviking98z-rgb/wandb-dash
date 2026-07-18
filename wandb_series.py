@@ -74,17 +74,36 @@ def main():
             metrics = {}
             for k in mkeys:
                 try:
-                    pts = [[row.get("_step"), row.get(k)]
-                           for row in r.history(samples=a.samples, keys=[k], pandas=False)
+                    pts = [[row.get("_step"), row.get(k), row.get("_timestamp")]
+                           for row in r.history(samples=a.samples, keys=[k, "_timestamp"], pandas=False)
                            if isinstance(row.get(k), (int, float))]
                     if len(pts) >= 2:
                         metrics[k] = pts
                 except Exception:
                     pass
+            # config(仅标量, 截断) + summary(各 metric 终值) —— 供前端 run 详情/表格
+            cfg = {}
+            try:
+                for ck, cv in dict(r.config).items():
+                    if ck.startswith("_") or not isinstance(cv, (int, float, str, bool)):
+                        continue
+                    cfg[ck] = cv
+                    if len(cfg) >= 40:
+                        break
+            except Exception:
+                pass
+            summ = {}
+            try:
+                for sk in mkeys:
+                    sv = r.summary.get(sk)
+                    if isinstance(sv, (int, float)):
+                        summ[sk] = sv
+            except Exception:
+                pass
             out["runs"].append({
                 "name": r.name, "id": r.id, "project": proj, "state": r.state,
                 "age_sec": int(age) if age and age < 1e17 else None,
-                "metrics": metrics,
+                "metrics": metrics, "config": cfg, "summary": summ,
             })
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"
