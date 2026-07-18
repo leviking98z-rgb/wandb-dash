@@ -9,8 +9,8 @@ HTTP 请求只读快照 → 恒定秒开、重启即热、不内联等 wandb。s
   --run-project P --run-id I 单 run 的曲线+config+summary(按需 + 落盘)
 端点: /api/wandb/{projects,runs?project=X,history?project=&id=} + /health(含 sync 状态)。
 前端: 顶部下拉先选项目; 侧栏可经左侧竖条折叠; 每图带可点图例; 无表格。
-  看数值: 桌面悬停; 手机【触碰/滑动曲线】即显示(吸附到真实数据点, 不看插值中间值,
-  抬手保留, 点别处消失)。缩放: 桌面拖框选, 手机【双指捏合】; 双击复位。
+  看数值: 桌面悬停; 手机【长按/拖动曲线】显示(吸附到真实数据点, 不看插值中间值)。
+  缩放: 桌面拖框选; 手机【单点定范围端点→再点一处放大, 同处再点复位】; 双击复位。
 WANDB_API_KEY 运行时从 .clusters/.tools/mon_wandb.sh 抽(不把密钥写进本仓库)。
 """
 from __future__ import annotations
@@ -452,9 +452,6 @@ function render(){
 
 function drawChart(card,metric,runsForMetric){
  const W=560,H=210,pl=54,pr=12,pt=10,pb=24;
- // 全量 x 范围(未缩放)—— 供双指缩放夹取/判断复位
- let fx=[];runsForMetric.forEach(r=>(r.metrics[metric]||[]).forEach(p=>{const x=getX(p);if(isFinite(x))fx.push(x);}));
- const fullX0=fx.length?Math.min(...fx):0, fullX1=fx.length?Math.max(...fx):1;
  let series=runsForMetric.map(r=>{
    let pts=(r.metrics[metric]||[]).map(p=>({x:getX(p),y:p[1]})).filter(p=>isFinite(p.x)&&isFinite(p.y)).sort((a,b)=>a.x-b.x);
    const z=zoom[metric];if(z)pts=pts.filter(p=>p.x>=z[0]&&p.x<=z[1]);
@@ -479,11 +476,11 @@ function drawChart(card,metric,runsForMetric){
   <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;touch-action:none">${grid}${lines}${xl}
   <g class="dots"></g>
   <line class="cross" y1="${pt}" y2="${H-pb}" stroke="#8b949e" stroke-dasharray="3,3" style="display:none"></line>
+  <line class="marker" y1="${pt}" y2="${H-pb}" stroke="#58a6ff" stroke-width="1.5" style="display:none"></line>
   <rect class="band" y="${pt}" height="${H-pt-pb}" fill="#58a6ff33" style="display:none"></rect>
   <rect class="ov" x="${pl}" y="${pt}" width="${W-pl-pr}" height="${H-pt-pb}" fill="transparent" style="cursor:crosshair"></rect></svg>${legend}`;
- const svg=card.querySelector('svg'),cross=svg.querySelector('.cross'),band=svg.querySelector('.band'),ov=svg.querySelector('.ov'),dots=svg.querySelector('.dots');
+ const svg=card.querySelector('svg'),cross=svg.querySelector('.cross'),band=svg.querySelector('.band'),ov=svg.querySelector('.ov'),dots=svg.querySelector('.dots'),marker=svg.querySelector('.marker');
  const evX=ev=>{const r=svg.getBoundingClientRect();const sx=(ev.clientX-r.left)/r.width*W;return{sx,dx:x0+(sx-pl)/(W-pl-pr)*xr};};
- const cxToDx=cx=>{const r=svg.getBoundingClientRect();return x0+((cx-r.left)/r.width*W-pl)/(W-pl-pr)*xr;};
  const hideTip=()=>{cross.style.display='none';TIP().style.display='none';dots.innerHTML='';};
  const inspect=ev=>{const {dx}=evX(ev);if(!gridX.length)return;
    let snap=gridX[0],bd=1e18;for(const gx of gridX){const d=Math.abs(gx-dx);if(d<bd){bd=d;snap=gx;}}   // 吸附到最近真实数据点
@@ -498,30 +495,38 @@ function drawChart(card,metric,runsForMetric){
    let top=isTouch(ev)?(ev.clientY-t.offsetHeight-22):(ev.clientY+12);   // 触屏: tooltip 放手指【上方】不被挡
    if(top<6)top=ev.clientY+22;
    t.style.left=left+'px';t.style.top=top+'px';};
- let drag=null,scrub=false;const ptrs=new Map();let pinch=null;
+ // ------- 交互 -------
+ // 鼠标(不变): 悬停看值 · 拖框放大 · 双击复位
+ // 触屏(按用户方案): 长按/拖动=看数值 · 单点=定范围端点(出蓝线) · 再点另一处=框选放大 · 同处再点=复位
+ let drag=null;                     // 鼠标框选
+ let rangeA=null;                   // 触屏第一个范围端点(data-x)
+ let downCX=0,downT=0,moved=false,lpActive=false,lpTimer=0;   // 触屏手势判定
+ const clearRange=()=>{rangeA=null;marker.style.display='none';};
  ov.addEventListener('pointermove',ev=>{
-   if(isTouch(ev)&&ptrs.has(ev.pointerId))ptrs.set(ev.pointerId,ev.clientX);
-   if(pinch&&ptrs.size>=2){const v=[...ptrs.values()];const nd=Math.abs(v[0]-v[1])||1;   // 双指: 张开→放大
-     const factor=Math.max(0.04,Math.min(25,pinch.d0/nd));const nw=xr*factor;
-     let na=Math.max(fullX0,pinch.center-nw/2),nb=Math.min(fullX1,pinch.center+nw/2);pinch.range=[na,nb];
-     const bx0=Math.max(pl,Math.min(W-pr,X(na))),bx1=Math.max(pl,Math.min(W-pr,X(nb)));
-     band.setAttribute('x',Math.min(bx0,bx1));band.setAttribute('width',Math.abs(bx1-bx0)||1);band.style.display='';return;}
    if(drag!=null){const sx=evX(ev).sx;const a=X(drag);band.setAttribute('x',Math.min(a,sx));band.setAttribute('width',Math.abs(sx-a));band.style.display='';cross.style.display='none';TIP().style.display='none';dots.innerHTML='';return;}
-   if(scrub||!isTouch(ev))inspect(ev);});
+   if(isTouch(ev)){
+     if(!lpActive&&Math.abs(ev.clientX-downCX)>8){moved=true;lpActive=true;if(lpTimer){clearTimeout(lpTimer);lpTimer=0;}}  // 拖动即看数值
+     if(lpActive)inspect(ev);
+     return;}
+   inspect(ev);});   // 鼠标 hover
  ov.addEventListener('pointerdown',ev=>{ov.setPointerCapture(ev.pointerId);
-   if(isTouch(ev)){ptrs.set(ev.pointerId,ev.clientX);
-     if(ptrs.size>=2){const v=[...ptrs.values()];const mid=(v[0]+v[1])/2;
-       pinch={d0:Math.abs(v[0]-v[1])||1,center:Math.max(fullX0,Math.min(fullX1,cxToDx(mid)))};
-       scrub=false;drag=null;hideTip();return;}
-     scrub=true;inspect(ev);return;}
-   drag=evX(ev).dx;});   // 鼠标: 框选放大
+   if(!isTouch(ev)){drag=evX(ev).dx;return;}                                  // 鼠标: 框选
+   downCX=ev.clientX;downT=Date.now();moved=false;lpActive=false;
+   lpTimer=setTimeout(()=>{lpActive=true;inspect(ev);},350);});               // 长按: 显数值
  ov.addEventListener('pointerup',ev=>{
-   if(isTouch(ev))ptrs.delete(ev.pointerId);
-   if(pinch){if(ptrs.size<2){band.style.display='none';const r=pinch.range;pinch=null;
-     if(r){const[na,nb]=r;if(nb-na>0&&nb-na<(fullX1-fullX0)*0.985)zoom[metric]=[na,nb];else delete zoom[metric];render();}}return;}
    if(drag!=null){const dx=evX(ev).dx;const a=Math.min(drag,dx),b=Math.max(drag,dx);drag=null;band.style.display='none';if(b-a>xr*0.02){zoom[metric]=[a,b];render();}return;}
-   scrub=false;});   // 触屏抬手: 保留 tooltip 让用户读(轻点别处消失)
- ov.addEventListener('pointercancel',ev=>{ptrs.delete(ev.pointerId);if(ptrs.size<2){pinch=null;band.style.display='none';}});
+   if(!isTouch(ev))return;
+   if(lpTimer){clearTimeout(lpTimer);lpTimer=0;}
+   if(!moved&&!lpActive&&Date.now()-downT<350){                              // === 一次"单点" ===
+     const dx=evX(ev).dx;
+     if(rangeA==null){rangeA=dx;marker.setAttribute('x1',X(dx));marker.setAttribute('x2',X(dx));marker.style.display='';hideTip();}  // 定第一个端点(蓝线)
+     else{const a=Math.min(rangeA,dx),b=Math.max(rangeA,dx);clearRange();
+       if(b-a<xr*0.03){delete zoom[metric];}   // 同处再点 → 复位
+       else{zoom[metric]=[a,b];}               // 另一处 → 框选放大
+       render();}
+     return;}
+   lpActive=false;});   // 长按/拖动看数值 抬手: 保留 tooltip(轻点别处消失)
+ ov.addEventListener('pointercancel',ev=>{if(lpTimer){clearTimeout(lpTimer);lpTimer=0;}lpActive=false;});
  ov.addEventListener('pointerleave',ev=>{if(!isTouch(ev))hideTip();});
  svg.addEventListener('dblclick',()=>{if(zoom[metric]){delete zoom[metric];render();}});
 }
@@ -535,7 +540,7 @@ async function detail(id){const r=(RAW.runs||[]).find(x=>x.id===id);if(!r)return
   <div class=sec>config</div><table>${kv(r.config)}</table>`;
  q('modal').style.display='flex';
 }
-if(TOUCH){q('cthint').textContent='单指点/划曲线看数值(吸附到数据点·抬手保留·点别处消失) · 双指捏合缩放 · 双击复位';}
+if(TOUCH){q('cthint').textContent='长按/拖动看数值(吸附数据点) · 单点定范围端点 · 再点一处放大 · 同处再点复位';}
 // 触屏: 轻点图表外任意处 → 收起钉住的数值气泡与高亮点
 document.addEventListener('pointerdown',ev=>{if(isTouch(ev)&&!(ev.target&&ev.target.classList&&ev.target.classList.contains('ov'))){TIP().style.display='none';document.querySelectorAll('svg .cross').forEach(c=>c.style.display='none');document.querySelectorAll('svg .dots').forEach(g=>g.innerHTML='');}});
 if(innerWidth<=640)document.body.classList.add('collapsed');
