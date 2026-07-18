@@ -8,7 +8,9 @@ HTTP 请求只读快照 → 恒定秒开、重启即热、不内联等 wandb。s
   --project X                该 project 全部 run 的元数据 + 前 N 个的曲线
   --run-project P --run-id I 单 run 的曲线+config+summary(按需 + 落盘)
   --set-group ...            设某 run 的 group 并 r.update() 写回 online wandb
-端点: /api/wandb/{projects,runs?project=X,history,setgroup(POST)} + /health(含 sync 状态)。
+端点: /api/wandb/{projects,runs?project=X,history,setgroup(POST),viewstate(GET/POST)} + /health。
+  viewstate: 看板视图状态(选中项目/各项目显示哪些 run/平滑·对数·X轴/侧栏)存 .cache/,
+  与浏览器无关(loopback 端口每开 app 会变, localStorage 存不住)→ 重进保留曲线选择。
 前端: 顶部下拉先选项目; 侧栏可经左侧竖条折叠; 每图带可点图例; 无表格。
   曲线区分 18 色 × 5 线型(实/虚/点/点划)=90 种; group 作为标签显示, 详情弹框可
   编辑 group 并同步 online, wandb tags 只读显示。
@@ -310,6 +312,21 @@ async def api_setgroup(request):
     return JSONResponse(d)
 
 
+async def api_viewstate(request):
+    """看板视图状态(选中项目/各项目显示哪些 run/平滑·对数·X轴/侧栏)持久化到 .cache,
+    与浏览器无关(loopback 端口每次开 app 会变, localStorage 存不住) → 存服务端。"""
+    if request.method == "POST":
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if isinstance(body, dict):
+            _write_json("viewstate.json", body)
+        return JSONResponse({"ok": True})
+    d = _read_json("viewstate.json")
+    return JSONResponse(d if isinstance(d, dict) else {})
+
+
 async def index(request):
     return HTMLResponse(_PAGE)
 
@@ -403,6 +420,12 @@ const PAL=['#58a6ff','#3fb950','#f2cc60','#f85149','#bc8cff','#39c5cf','#ff7b72'
 const DASHES=['','6,3','1,3','9,4,2,4','3,3'];   // 实线/长虚/点线/点划/短虚 —— 颜色用完再叠线型, 18×5=90 种
 let RAW={runs:[]}; const hidden=new Set(); const zoom={}; const COLOR={}; const DASH={}; let inited=false;
 let PROJECTS=[]; let curProj=null;
+let VIEW={hidden:{}}; let _saveT=null;   // 服务端持久化的视图状态
+function saveView(){clearTimeout(_saveT);_saveT=setTimeout(()=>{fetch('/api/wandb/viewstate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(VIEW)}).catch(()=>{});},400);}
+function restoreCtl(){const c=VIEW.ctl;if(!c)return;
+ if(typeof c.smooth==='number'){smooth=c.smooth;q('sm').value=c.smooth;q('smv').textContent=c.smooth.toFixed(2);}
+ if(typeof c.logY==='boolean'){logY=c.logY;q('logy').checked=c.logY;}
+ if(c.xmode){xmode=c.xmode;q('xstep').checked=(c.xmode==='step');q('xtime').checked=(c.xmode==='time');}}
 let smooth=0,logY=false,xmode='step'; let page=0; const PS=10;
 const q=id=>document.getElementById(id), TIP=()=>q('tip');
 const nMetrics=r=>Object.keys(r&&r.metrics||{}).length;
@@ -414,24 +437,32 @@ function fmtRt(s){if(s==null)return '—';s=Math.round(s);const h=Math.floor(s/3
 function getX(p){return xmode==='time'?(p[2]?p[2]*1000:NaN):p[0];}
 function ema(pts,a){if(!(a>0))return pts.map(p=>[p.x,p.y]);let s=null,o=[];for(const p of pts){s=s==null?p.y:a*s+(1-a)*p.y;o.push([p.x,s]);}return o;}
 
-function apply(){smooth=parseFloat(q('sm').value)||0;q('smv').textContent=smooth.toFixed(2);logY=q('logy').checked;xmode=q('xstep').checked?'step':'time';render();}
+function apply(){smooth=parseFloat(q('sm').value)||0;q('smv').textContent=smooth.toFixed(2);logY=q('logy').checked;xmode=q('xstep').checked?'step':'time';VIEW.ctl={smooth,logY,xmode};saveView();render();}
 function resetZoom(){for(const k in zoom)delete zoom[k];render();}
-async function toggleRun(id){if(hidden.has(id)){hidden.delete(id);await ensureHistory(id);}else{hidden.add(id);}render();}
+async function toggleRun(id){if(hidden.has(id)){hidden.delete(id);await ensureHistory(id);}else{hidden.add(id);}if(curProj){VIEW.hidden[curProj]=[...hidden];saveView();}render();}
 function updateGrip(){const c=document.body.classList.contains('collapsed');q('grip').innerHTML='<span>'+(c?'运行 ▸':'◂ 收起')+'</span>';}
-function toggleSide(){document.body.classList.toggle('collapsed');updateGrip();}
-function collapseSide(){document.body.classList.add('collapsed');updateGrip();}
+function toggleSide(){document.body.classList.toggle('collapsed');updateGrip();VIEW.collapsed=document.body.classList.contains('collapsed');saveView();}
+function collapseSide(){document.body.classList.add('collapsed');updateGrip();VIEW.collapsed=true;saveView();}
 
 async function boot(){
- try{const r=await fetch('/api/wandb/projects');const d=await r.json();
-   PROJECTS=d.projects||[];
-   q('sub').textContent=(d.entity||'')+(d.error?(' · ⚠'+d.error):'');
-   q('proj').innerHTML=PROJECTS.map(p=>`<option value="${p.name}">${p.running?'● ':''}${p.name}</option>`).join('');
-   const def=(PROJECTS.find(p=>p.running)||PROJECTS[0]||{}).name;
-   if(def){q('proj').value=def;await selectProject(def);}else q('charts').textContent='无 project';
- }catch(e){q('charts').textContent='加载 project 失败: '+e;}
+ let pj={};
+ try{const [vs,p]=await Promise.all([
+   fetch('/api/wandb/viewstate').then(r=>r.json()).catch(()=>({})),
+   fetch('/api/wandb/projects').then(r=>r.json()).catch(()=>({}))]);
+   VIEW=(vs&&typeof vs==='object')?vs:{}; VIEW.hidden=VIEW.hidden||{}; pj=p||{};
+ }catch(e){VIEW={hidden:{}};}
+ restoreCtl();
+ if(typeof VIEW.collapsed==='boolean')document.body.classList.toggle('collapsed',VIEW.collapsed);
+ else if(innerWidth<=640)document.body.classList.add('collapsed');
+ updateGrip();
+ PROJECTS=pj.projects||[];
+ q('sub').textContent=(pj.entity||'')+(pj.error?(' · ⚠'+pj.error):'');
+ q('proj').innerHTML=PROJECTS.map(p=>`<option value="${p.name}">${p.running?'● ':''}${p.name}</option>`).join('');
+ const def=(VIEW.proj&&PROJECTS.some(p=>p.name===VIEW.proj))?VIEW.proj:((PROJECTS.find(p=>p.running)||PROJECTS[0]||{}).name);
+ if(def){q('proj').value=def;await selectProject(def);}else q('charts').textContent='无 project';
 }
 async function selectProject(name){
- curProj=name;inited=false;page=0;hidden.clear();RAW={runs:[]};
+ curProj=name;inited=false;page=0;hidden.clear();RAW={runs:[]};VIEW.proj=name;saveView();
  q('charts').textContent='加载 '+name+' …';q('runlist').innerHTML='';q('pager').innerHTML='';
  await loadRuns();
 }
@@ -448,10 +479,13 @@ async function loadRuns(){if(!curProj)return;try{
  q('upd').textContent='更新 '+(RAW.cached?RAW.cached+'s前':'刚刚')+' · '+curProj+' · '+runs.length+' run · '+nc+' 有曲线';
  runs.forEach((r,i)=>{if(!COLOR[r.id]){COLOR[r.id]=PAL[i%PAL.length];DASH[r.id]=DASHES[Math.floor(i/PAL.length)%DASHES.length];}});
  if(!inited){inited=true;
-   // 默认只画在跑的(没有则画前几个有曲线的), 其余 run 都在侧栏列表里可勾选
-   const running=runs.filter(r=>r.state==='running');
-   const show=(running.length?running:runs.filter(r=>nMetrics(r)).slice(0,6)).map(r=>r.id);
-   const ss=new Set(show); runs.forEach(r=>{if(!ss.has(r.id))hidden.add(r.id);});
+   const saved=VIEW.hidden&&VIEW.hidden[curProj];
+   if(Array.isArray(saved)){hidden.clear();saved.forEach(id=>hidden.add(id));}   // 恢复上次的曲线选择
+   else{  // 首次: 默认只画在跑的(没有则画前几个有曲线的), 其余 run 都在侧栏可勾选
+     const running=runs.filter(r=>r.state==='running');
+     const show=(running.length?running:runs.filter(r=>nMetrics(r)).slice(0,6)).map(r=>r.id);
+     const ss=new Set(show); runs.forEach(r=>{if(!ss.has(r.id))hidden.add(r.id);});
+   }
  }
  render();
 }catch(e){q('charts').textContent='加载失败: '+e;}}
@@ -602,8 +636,7 @@ async function saveGroup(id){const r=(RAW.runs||[]).find(x=>x.id===id);if(!r)ret
 if(TOUCH){q('cthint').textContent='长按/拖动看数值(吸附数据点) · 单点定范围端点 · 再点一处放大 · 同处再点复位';}
 // 触屏: 轻点图表外任意处 → 收起钉住的数值气泡与高亮点
 document.addEventListener('pointerdown',ev=>{if(isTouch(ev)&&!(ev.target&&ev.target.classList&&ev.target.classList.contains('ov'))){TIP().style.display='none';document.querySelectorAll('svg .cross').forEach(c=>c.style.display='none');document.querySelectorAll('svg .dots').forEach(g=>g.innerHTML='');}});
-if(innerWidth<=640)document.body.classList.add('collapsed');
-updateGrip(); boot(); setInterval(()=>{if(curProj)loadRuns();},30000);
+boot(); setInterval(()=>{if(curProj)loadRuns();},30000);
 </script></body></html>"""
 
 
@@ -614,6 +647,7 @@ routes = [
     Route("/api/wandb/runs", api_runs, methods=["GET"]),
     Route("/api/wandb/history", api_history, methods=["GET"]),
     Route("/api/wandb/setgroup", api_setgroup, methods=["POST"]),
+    Route("/api/wandb/viewstate", api_viewstate, methods=["GET", "POST"]),
 ]
 
 _seed_from_disk()   # 导入即用上次落盘的快照(重启即热)
