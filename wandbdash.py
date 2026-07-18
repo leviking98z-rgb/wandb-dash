@@ -115,6 +115,9 @@ svg text{fill:var(--dim);font-size:10px}
 #tip{position:fixed;pointer-events:none;background:#1f2733;border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-size:11px;display:none;z-index:9;max-width:260px;box-shadow:0 2px 8px #0008}
 #tip b{color:var(--fg)}
 details{margin-top:12px}summary{cursor:pointer;color:#58a6ff;font-weight:600}
+#menu{display:none}
+#sideback{display:none;position:fixed;inset:0;background:#0008;z-index:29}
+#sideback.on{display:block}
 table{border-collapse:collapse;width:100%;font-size:11px;margin-top:6px}
 th,td{border:1px solid var(--line);padding:3px 8px;text-align:right;white-space:nowrap}
 th:first-child,td:first-child{text-align:left}
@@ -124,10 +127,15 @@ td.name{color:#58a6ff;cursor:pointer}
 #modal{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;z-index:20}
 #modalbox{background:var(--card);border:1px solid var(--line);border-radius:10px;max-width:90vw;max-height:80vh;overflow:auto;padding:16px;min-width:300px}
 .sec{margin:14px 0 4px;font-size:13px;font-weight:600;color:#58a6ff}
-@media(max-width:640px){#wrap{flex-direction:column}#side{width:100%;position:static;max-height:300px}}
+@media(max-width:640px){
+ #menu{display:inline-block}
+ #side{position:fixed;top:0;left:0;height:100vh;width:82vw;max-width:320px;max-height:none;z-index:30;transform:translateX(-102%);transition:transform .2s;border-radius:0}
+ #side.open{transform:none;box-shadow:2px 0 16px #000a}
+}
 </style></head><body>
-<header><h1>📈 wandb workspace</h1><span class=dim id=sub></span><span class=spacer></span>
+<header><button id=menu onclick=toggleSide()>☰ 运行</button><h1>📈 wandb workspace</h1><span class=dim id=sub></span><span class=spacer></span>
 <span class=dim id=upd></span><button onclick=load()>刷新</button></header>
+<div id=sideback onclick=toggleSide()></div>
 <div id=wrap>
  <aside id=side>
   <input id=filter placeholder="过滤 run(名/状态/项目)…" oninput="page=0;render()">
@@ -164,6 +172,7 @@ function ema(pts,a){if(!(a>0))return pts.map(p=>[p.x,p.y]);let s=null,o=[];for(c
 function apply(){smooth=parseFloat(q('sm').value)||0;q('smv').textContent=smooth.toFixed(2);logY=q('logy').checked;xmode=q('xstep').checked?'step':'time';render();}
 function resetZoom(){for(const k in zoom)delete zoom[k];render();}
 function toggleRun(id){hidden.has(id)?hidden.delete(id):hidden.add(id);render();}
+function toggleSide(){const s=q('side');const on=s.classList.toggle('open');q('sideback').classList.toggle('on',on);}
 
 async function load(){try{const r=await fetch('/api/wandb/runs');RAW=await r.json();
  q('sub').textContent=(RAW.entity||'')+(RAW.error?(' · ⚠'+RAW.error):'');
